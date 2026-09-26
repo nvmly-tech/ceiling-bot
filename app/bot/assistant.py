@@ -185,7 +185,9 @@ class LeadAssistant:
     async def summarize(self, lead: Lead, history: list[Message]) -> Summary:
         status = {"qualified": "анкета заполнена", "abandoned": "анкету не закончил"}.get(lead.status, lead.status)
         anketa = json.dumps(known_fields(lead, mask_phone=True), ensure_ascii=False)
-        user = f"Статус: {status}.\nАнкета: {anketa}\n\nПереписка:\n{transcript(history)}"
+        # Тег закрытия в тексте клиента ломается: иначе клиент мог бы «закончить» переписку и дописать свои указания.
+        dialog = transcript(history).replace("</переписка>", "</ переписка>")
+        user = f"Статус: {status}.\nАнкета: {anketa}\n\n<переписка>\n{dialog}\n</переписка>"
         summary, model = await self.router.json(
             [
                 {"role": "system", "content": prompts.SUMMARY_SYSTEM},
