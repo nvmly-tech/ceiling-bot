@@ -1,0 +1,51 @@
+"""Кнопки в чате менеджеров: «Взял в работу»."""
+
+from datetime import datetime
+from html import escape
+
+from aiogram import F, Router
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, LinkPreviewOptions
+
+from app.config import Settings
+from app.db import Database
+from app.services.notifier import Notifier
+
+
+def _without_take(markup: InlineKeyboardMarkup | None, lead_id: int) -> InlineKeyboardMarkup | None:
+    """Убрать кнопку «Взял» этого лида (в дайджесте остальные кнопки остаются)."""
+    if markup is None:
+        return None
+    rows = [[b for b in row if b.callback_data != f"take:{lead_id}"] for row in markup.inline_keyboard]
+    rows = [row for row in rows if row]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+async def on_take(cb: CallbackQuery, db: Database, settings: Settings, notifier: Notifier) -> None:
+    if cb.message is None or cb.message.chat.id != await notifier.chat_id():
+        await cb.answer()
+        return
+    lead_id = int(cb.data.split(":", 1)[1])
+    lead = await db.get_lead(lead_id)
+    if lead is None:
+        await cb.answer("Заявка не найдена", show_alert=True)
+        return
+    by = cb.from_user.full_name
+    if await db.take_lead(lead_id, by_id=cb.from_user.id, by_name=by):
+        await cb.answer(f"Заявка №{lead_id} ваша 👍")
+        when = datetime.now(settings.zone).strftime("%H:%M")
+        mark = f"\n\n✅ №{lead_id} взял(а): <b>{escape(by)}</b> · {when}"
+    else:
+        await cb.answer(f"Уже взял(а) {lead.taken_by_name}", show_alert=True)
+        mark = ""
+    await cb.message.edit_text(
+        cb.message.html_text + mark,
+        parse_mode="HTML",
+        reply_markup=_without_take(cb.message.reply_markup, lead_id),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+def create_manager_router() -> Router:
+    r = Router(name="manager")
+    r.callback_query.register(on_take, F.data.startswith("take:"))
+    return r

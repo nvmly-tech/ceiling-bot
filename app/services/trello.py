@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from app.db import CARD_COMMENT, CARD_CREATE, CARD_UPDATE, Database, Lead, Message, OutboxTask
+from app.db import CARD_COMMENT, CARD_CREATE, CARD_TAKE, CARD_UPDATE, Database, Lead, Message, OutboxTask
 
 log = logging.getLogger(__name__)
 
@@ -164,7 +164,12 @@ class TrelloSync:
 
     @property
     def handlers(self):
-        return {CARD_CREATE: self.create_card, CARD_UPDATE: self.update_card, CARD_COMMENT: self.add_comment}
+        return {
+            CARD_CREATE: self.create_card,
+            CARD_UPDATE: self.update_card,
+            CARD_COMMENT: self.add_comment,
+            CARD_TAKE: self.take_card,
+        }
 
     async def board(self) -> Board:
         """Найти списки и метки на доске, недостающие создать. Результат кешируется."""
@@ -213,7 +218,7 @@ class TrelloSync:
         card = await self.client.create_card(
             board.list_new, card_name(lead), card_desc(lead, self.zone), self.label_ids(lead, board)
         )
-        await self.db.update_lead(lead.id, trello_card_id=card["id"])
+        await self.db.update_lead(lead.id, trello_card_id=card["id"], trello_card_url=card.get("shortUrl"))
         log.info("Trello: карточка для лида %s создана: %s", lead.id, card.get("shortUrl"))
 
     async def update_card(self, task: OutboxTask) -> None:
@@ -229,6 +234,14 @@ class TrelloSync:
             desc=card_desc(lead, self.zone),
             idLabels=",".join(manual + self.label_ids(lead, board)),
         )
+
+    async def take_card(self, task: OutboxTask) -> None:
+        """Менеджер нажал «Взял в работу»: карточка переезжает в список «В работе»."""
+        lead = await self._lead(task)
+        board = await self.board()
+        card_id = await self._card_id(lead)
+        await self.client.update_card(card_id, idList=board.list_in_work)
+        await self.client.add_comment(card_id, f"✅ Взял в работу: **{task.payload['by']}**")
 
     async def add_comment(self, task: OutboxTask) -> None:
         lead = await self._lead(task)

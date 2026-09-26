@@ -1,7 +1,8 @@
 """Воркер очереди outbox: выполняет внешние вызовы (Trello и др.) с ретраями.
 
-Задачи одного лида выполняются строго по порядку: если задача упала, следующие задачи
-этого лида ждут её успешного повтора. Задачи других лидов продолжают выполняться.
+У каждого лида своя очередь на каждый канал (trello:<лид>, tg:<лид>). Задачи одной очереди
+выполняются строго по порядку: если задача упала, следующие ждут её успешного повтора.
+Остальные очереди продолжают работать — упавший Trello не задерживает уведомления в Telegram.
 """
 
 import asyncio
@@ -36,17 +37,17 @@ class Outbox:
     async def run_once(self, now: datetime | None = None) -> int:
         """Один проход по очереди. Возвращает число выполненных задач."""
         now = now or datetime.now(UTC)
-        blocked: set[int] = set()
+        blocked: set[str] = set()
         done = 0
         for task in await self.db.outbox_pending():
-            if task.lead_id is not None and task.lead_id in blocked:
+            if task.queue is not None and task.queue in blocked:
                 continue
             handler = self.handlers.get(task.kind)
             not_due = datetime.fromisoformat(task.next_attempt_at) > now
             if handler is None or not_due:
                 # Нет обработчика (например, Trello не настроен) или ретрай ещё не наступил — ждём, сохраняя порядок.
-                if task.lead_id is not None:
-                    blocked.add(task.lead_id)
+                if task.queue is not None:
+                    blocked.add(task.queue)
                 continue
             try:
                 await handler(task)
@@ -54,8 +55,8 @@ class Outbox:
                 delay = backoff(task.attempts)
                 log.warning("outbox #%s %s (лид %s): %s; повтор через %s", task.id, task.kind, task.lead_id, e, delay)
                 await self.db.outbox_retry(task.id, str(e), (now + delay).isoformat(timespec="seconds"))
-                if task.lead_id is not None:
-                    blocked.add(task.lead_id)
+                if task.queue is not None:
+                    blocked.add(task.queue)
                 continue
             await self.db.outbox_done(task.id)
             done += 1

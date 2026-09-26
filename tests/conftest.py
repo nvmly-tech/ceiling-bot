@@ -4,6 +4,7 @@ from typing import Any
 import pytest
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
+from aiogram.exceptions import TelegramMigrateToChat
 from aiogram.methods import (
     AnswerCallbackQuery,
     EditMessageText,
@@ -18,6 +19,9 @@ from app.main import build_dispatcher
 
 USER = User(id=42, is_bot=False, first_name="Анна", last_name="Петрова", username="anna")
 CHAT = Chat(id=42, type="private")
+MANAGER_CHAT = Chat(id=-5000, type="group", title="Менеджеры")
+MANAGER = User(id=7, is_bot=False, first_name="Иван", last_name="Менеджеров")
+MANAGER2 = User(id=8, is_bot=False, first_name="Олег")
 
 
 class FakeSession(BaseSession):
@@ -27,12 +31,18 @@ class FakeSession(BaseSession):
         super().__init__()
         self.calls: list[TelegramMethod] = []
         self._msg_id = 1000
+        self.migrate: dict[int, int] = {}  # chat_id → новый id: имитация превращения группы в супергруппу
 
     async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
+        if isinstance(method, SendMessage) and method.chat_id in self.migrate:
+            new_id = self.migrate[method.chat_id]
+            raise TelegramMigrateToChat(method=method, message="migrated", migrate_to_chat_id=new_id)
         self.calls.append(method)
         if isinstance(method, (SendMessage, EditMessageText)):
             self._msg_id += 1
-            return Message(message_id=self._msg_id, date=datetime.now(UTC), chat=CHAT, text=method.text)
+            chat_id = method.chat_id or CHAT.id
+            chat = CHAT if chat_id == CHAT.id else Chat(id=chat_id, type="group")
+            return Message(message_id=self._msg_id, date=datetime.now(UTC), chat=chat, text=method.text)
         if isinstance(method, AnswerCallbackQuery):
             return True
         raise NotImplementedError(type(method).__name__)
@@ -43,8 +53,11 @@ class FakeSession(BaseSession):
     async def close(self) -> None:
         pass
 
-    def sent(self) -> list[SendMessage]:
-        return [c for c in self.calls if isinstance(c, SendMessage)]
+    def sent(self, chat_id: int | None = None) -> list[SendMessage]:
+        return [c for c in self.calls if isinstance(c, SendMessage) and (chat_id is None or c.chat_id == chat_id)]
+
+    def edits(self) -> list[EditMessageText]:
+        return [c for c in self.calls if isinstance(c, EditMessageText)]
 
 
 class Client:
@@ -76,12 +89,24 @@ class Client:
 
     async def press(self, data: str) -> None:
         # Кнопка висит под последним сообщением бота.
-        question = Message(message_id=999, date=datetime.now(UTC), chat=CHAT, text=self.session.sent()[-1].text)
+        question = Message(message_id=999, date=datetime.now(UTC), chat=CHAT, text=self.session.sent(CHAT.id)[-1].text)
         cb = CallbackQuery(id=str(self._update_id), from_user=USER, chat_instance="ci", message=question, data=data)
         await self._feed(callback_query=cb)
 
+    async def press_in_group(self, sent: SendMessage, data: str, user: User = MANAGER, chat: Chat = MANAGER_CHAT):
+        """Менеджер нажимает кнопку под сообщением бота в группе."""
+        msg = Message(message_id=500, date=datetime.now(UTC), chat=chat, text=sent.text, reply_markup=sent.reply_markup)
+        self._update_id += 1
+        cb = CallbackQuery(id=f"g{self._update_id}", from_user=user, chat_instance="g", message=msg, data=data)
+        await self.dp.feed_update(self.bot, Update(update_id=self._update_id, callback_query=cb))
+
+    async def group_text(self, text: str, user: User = MANAGER) -> None:
+        self._update_id += 1
+        msg = Message(message_id=501, date=datetime.now(UTC), chat=MANAGER_CHAT, from_user=user, text=text)
+        await self.dp.feed_update(self.bot, Update(update_id=self._update_id, message=msg))
+
     def last_text(self) -> str:
-        return self.session.sent()[-1].text
+        return self.session.sent(CHAT.id)[-1].text
 
 
 @pytest.fixture

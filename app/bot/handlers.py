@@ -5,6 +5,7 @@
 """
 
 from dataclasses import dataclass
+from datetime import timedelta
 
 from aiogram import F, Router
 from aiogram.filters import CommandStart, StateFilter
@@ -21,7 +22,7 @@ from aiogram.types import (
 from app.bot import keyboards, texts
 from app.bot.states import QUESTIONS, Lead, next_question
 from app.config import Settings
-from app.db import Database, now_iso
+from app.db import TG_CLIENT_MSG, Database, now_iso
 from app.parsing import normalize_phone, parse_area
 from app.worktime import is_work_time, local_now, manager_eta
 
@@ -231,11 +232,13 @@ async def on_measure_time(message: Message, state: FSMContext, db: Database, set
 # --- после анкеты ---
 
 
-async def on_after_done(message: Message, state: FSMContext, db: Database) -> None:
+async def on_after_done(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
     data = await state.get_data()
     lead_id = data["lead_id"]
     await log_in(db, lead_id, incoming(message))
-    # Этап 3: уведомление менеджеру. Подтверждаем клиенту только первый раз, чтобы не спамить.
+    # Несколько сообщений подряд собираем в одно уведомление менеджеру.
+    await db.enqueue(TG_CLIENT_MSG, lead_id, coalesce=True, delay=timedelta(seconds=settings.client_msg_delay_sec))
+    # Клиенту подтверждаем только первый раз, чтобы не спамить.
     if not data.get("acked"):
         await state.update_data(acked=True)
         await say(message, db, lead_id, texts.AFTER_DONE_ACK)
@@ -264,6 +267,9 @@ async def on_other_content(message: Message, state: FSMContext, db: Database) ->
 def create_router() -> Router:
     """Порядок регистрации важен: aiogram берёт первый подходящий обработчик."""
     r = Router(name="dialog")
+    # Анкета — только в личке с клиентом; в группе менеджеров бот не задаёт вопросов.
+    r.message.filter(F.chat.type == "private")
+    r.callback_query.filter(F.message.chat.type == "private")
     r.message.register(on_start, CommandStart())
 
     r.callback_query.register(on_object_button, Lead.object, F.data.startswith("obj:"))
