@@ -17,7 +17,8 @@ fi
 echo ">> зависимости (Python 3.12 в $APP/python, venv в $APP/.venv)"
 export UV_PYTHON_INSTALL_DIR="$APP/python"
 uv sync --frozen --no-dev --python 3.12 --quiet
-chmod -R a+rX "$APP"   # сервис работает от временного пользователя — код и python должны быть читаемы
+# Сервис работает от временного пользователя: код и python читаемы всем, но писать может только root.
+chmod -R a+rX,go-w "$APP"
 
 mkdir -p "$ENV_DIR"
 chmod 700 "$ENV_DIR"
