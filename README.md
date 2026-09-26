@@ -86,9 +86,22 @@ uv run python -m app.main
 ## Тесты
 
 ```bash
-uv run pytest
-uvx ruff check app tests
+uv run pytest --cov        # тесты + покрытие (порог 93% — в pyproject.toml)
+uvx ruff check app tests deploy
 ```
+
+Тесты не ходят в сеть (Telegram, Trello, Groq, LLM подменены) и не читают `.env` — все настройки задаются
+в самих тестах. `tests/test_security.py` — регрессия по проверке безопасности, `tests/test_main.py` — сборка бота.
+
+## Публикация
+
+```bash
+./deploy/deploy.sh             # проверки + выкладка на aezn1
+./deploy/deploy.sh --check     # только проверки
+```
+
+Выкладка не начнётся, если в `ceiling-bot/` есть незакоммиченные изменения, линтер нашёл ошибки, упал
+хотя бы один тест или покрытие ниже порога. На сервер уходит закоммиченный `HEAD` (без `.env` и баз).
 
 ## Структура
 
