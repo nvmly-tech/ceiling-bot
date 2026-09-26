@@ -5,14 +5,28 @@
 """
 
 import logging
+import mimetypes
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
 
-from app.db import CARD_COMMENT, CARD_CREATE, CARD_TAKE, CARD_UPDATE, Database, Lead, Message, OutboxTask
+from app.db import (
+    CARD_ATTACH,
+    CARD_COMMENT,
+    CARD_CREATE,
+    CARD_TAKE,
+    CARD_TRANSCRIPT,
+    CARD_UPDATE,
+    Database,
+    Lead,
+    Message,
+    OutboxTask,
+)
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +42,12 @@ LABELS = {
 
 MODEL_NAMES = {"script": "скрипт (без LLM)"}
 
+ATTACH_GIVE_UP = 3  # файл не прикрепился за столько попыток — пишем об этом комментарий и идём дальше
+FILE_NAMES = {"voice": "голосовое", "photo": "фото", "document": "файл", "video_note": "видео"}
+DEFAULT_EXT = {"voice": ".ogg", "photo": ".jpg", "video_note": ".mp4"}
+
+FetchFile = Callable[[str], Awaitable[tuple[bytes, str]]]
+
 
 class TrelloError(Exception):
     pass
@@ -41,9 +61,12 @@ class TrelloClient:
     async def close(self) -> None:
         await self._http.aclose()
 
-    async def _call(self, method: str, path: str, json: dict[str, Any] | None = None) -> Any:
+    async def _call(
+        self, method: str, path: str, json: dict[str, Any] | None = None, *,
+        files: dict[str, Any] | None = None, data: dict[str, Any] | None = None,
+    ) -> Any:
         try:
-            resp = await self._http.request(method, path, params=self._auth, json=json)
+            resp = await self._http.request(method, path, params=self._auth, json=json, files=files, data=data)
         except httpx.HTTPError as e:
             # В тексте исключения httpx может быть URL с ключами — наружу только тип ошибки.
             raise TrelloError(f"{method} {path}: {type(e).__name__}") from None
@@ -76,6 +99,12 @@ class TrelloClient:
 
     async def add_comment(self, card_id: str, text: str) -> dict:
         return await self._call("POST", f"/cards/{card_id}/actions/comments", {"text": text[:COMMENT_LIMIT]})
+
+    async def add_attachment(self, card_id: str, filename: str, content: bytes, mime: str) -> dict:
+        return await self._call(
+            "POST", f"/cards/{card_id}/attachments",
+            files={"file": (filename, content, mime)}, data={"name": filename, "mimeType": mime},
+        )
 
 
 # --- оформление ---
@@ -135,9 +164,10 @@ def comment_text(msg: Message, zone: ZoneInfo) -> str:
     body = {
         "button": f"Нажал кнопку: **{msg.text}**",
         "contact": f"📱 Поделился номером: {msg.text}",
-        "voice": msg.text or "🎤 голосовое сообщение",
-        "photo": "📷 Фото" + (f": {msg.text}" if msg.text else "") + " (файл — в чате Telegram)",
-        "document": "📎 Файл" + (f": {msg.text}" if msg.text else "") + " (файл — в чате Telegram)",
+        "voice": f"🎤 Голосовое:\n\n> {msg.text}" if msg.text else "🎤 Голосовое (расшифровка будет ниже)",
+        "photo": "📷 Фото" + (f": {msg.text}" if msg.text else "") + " (во вложениях)",
+        "document": "📎 Файл" + (f": {msg.text}" if msg.text else "") + " (во вложениях)",
+        "video_note": "📹 Видеосообщение (во вложениях)",
     }.get(msg.kind, msg.text or "")
     return f"👤 **Клиент** · {when}\n\n{body}"
 
@@ -156,10 +186,12 @@ class TrelloSync:
     """Выполняет задачи outbox: создать карточку, обновить анкету, добавить комментарий."""
 
     def __init__(
-        self, db: Database, client: TrelloClient, board_id: str, zone: ZoneInfo, list_new: str, list_in_work: str
+        self, db: Database, client: TrelloClient, board_id: str, zone: ZoneInfo, list_new: str, list_in_work: str,
+        fetch_file: FetchFile | None = None,
     ):
         self.db, self.client, self.board_id, self.zone = db, client, board_id, zone
         self.list_names = (list_new, list_in_work)
+        self.fetch_file = fetch_file  # скачивание файлов из Telegram для вложений
         self._board: Board | None = None
 
     @property
@@ -169,6 +201,8 @@ class TrelloSync:
             CARD_UPDATE: self.update_card,
             CARD_COMMENT: self.add_comment,
             CARD_TAKE: self.take_card,
+            CARD_ATTACH: self.attach_file,
+            CARD_TRANSCRIPT: self.add_transcript,
         }
 
     async def board(self) -> Board:
@@ -243,9 +277,47 @@ class TrelloSync:
         await self.client.update_card(card_id, idList=board.list_in_work)
         await self.client.add_comment(card_id, f"✅ Взял в работу: **{task.payload['by']}**")
 
-    async def add_comment(self, task: OutboxTask) -> None:
-        lead = await self._lead(task)
+    async def _message(self, task: OutboxTask) -> Message:
         msg = await self.db.get_message(task.payload["message_id"])
         if msg is None:
             raise TrelloError(f"message {task.payload['message_id']} not found")
+        return msg
+
+    async def add_comment(self, task: OutboxTask) -> None:
+        lead = await self._lead(task)
+        msg = await self._message(task)
         await self.client.add_comment(await self._card_id(lead), comment_text(msg, self.zone))
+
+    async def attach_file(self, task: OutboxTask) -> None:
+        """Приложить к карточке файл из Telegram. Не вышло за несколько попыток — комментарий и дальше:
+        одна неудачная загрузка не должна задерживать остальную переписку."""
+        lead = await self._lead(task)
+        msg = await self._message(task)
+        card_id = await self._card_id(lead)
+        if self.fetch_file is None or not msg.file_id:
+            return
+        base = FILE_NAMES.get(msg.kind, "файл")
+        try:
+            content, tg_path = await self.fetch_file(msg.file_id)
+            ext = PurePosixPath(tg_path).suffix or DEFAULT_EXT.get(msg.kind, "")
+            if ext == ".oga":
+                ext = ".ogg"  # так файл открывается плеером в браузере
+            mime = mimetypes.guess_type(f"x{ext}")[0] or "application/octet-stream"
+            await self.client.add_attachment(card_id, f"{base}_{msg.id}{ext}", content, mime)
+        except Exception as e:
+            if task.attempts + 1 < ATTACH_GIVE_UP:
+                raise
+            log.error("Не удалось приложить %s к карточке лида %s: %s", base, lead.id, e)
+            when = f"{_local(msg.created_at, self.zone):%d.%m %H:%M}"
+            note = f"⚠️ Не удалось приложить {base} от {when} — смотрите в чате Telegram"
+            await self.client.add_comment(card_id, note)
+
+    async def add_transcript(self, task: OutboxTask) -> None:
+        lead = await self._lead(task)
+        msg = await self._message(task)
+        when = f"{_local(msg.created_at, self.zone):%d.%m %H:%M}"
+        if task.payload.get("failed"):
+            text = f"🎤 Голосовое от {when}: расшифровать не удалось — прослушайте вложение"
+        else:
+            text = f"🎤 Расшифровка голосового от {when}:\n\n> {msg.text}"
+        await self.client.add_comment(await self._card_id(lead), text)

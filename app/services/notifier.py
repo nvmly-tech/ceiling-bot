@@ -184,9 +184,15 @@ class Notifier:
         if not msgs:
             return
         lines = [f"💬 <b>№{lead.id} · {escape(lead.name or 'Клиент')} дописал(а) после анкеты:</b>", ""]
+        labels = {"voice": "🎤", "photo": "📷 фото", "document": "📎 файл", "video_note": "📹 видео", "contact": "📱"}
         for m in msgs:
-            text = m.text if m.kind in ("text", "voice") else f"[{m.kind}] {m.text or ''}".strip()
-            lines.append(f"• {escape(text or '')}")
+            if m.kind == "text":
+                text = m.text or ""
+            elif m.kind == "voice" and not m.text:
+                text = "🎤 голосовое (расшифровка — в карточке)"
+            else:
+                text = f"{labels.get(m.kind, m.kind)} {m.text or ''}".strip()
+            lines.append(f"• {escape(text)}")
         if lead.taken_by_name:
             lines.append(f"\nВ работе у {escape(lead.taken_by_name)}")
         if lead.trello_card_url:

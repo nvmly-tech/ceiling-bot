@@ -71,6 +71,11 @@ class FakeTrello(TrelloClient):
         self.cards[card_id]["comments"].append(text)
         return {"id": "A"}
 
+    async def add_attachment(self, card_id, filename, content, mime):
+        self._maybe_fail("add_attachment")
+        self.cards[card_id].setdefault("attachments", []).append((filename, content, mime))
+        return {"id": "F"}
+
     def label_names(self, card_id: str) -> set[str]:
         by_id = {lbl["id"]: lbl["name"] for lbl in self.labels_}
         return {by_id[i] for i in self.cards[card_id]["idLabels"]}
@@ -238,4 +243,4 @@ def test_comment_time_in_studio_zone():
 
     msg = Message(id=1, lead_id=1, direction="in", kind="voice", text=None, file_id="f", model=None,
                   created_at="2026-09-26T20:14:00+00:00")
-    assert comment_text(msg, ZONE) == "👤 **Клиент** · 26.09 23:14\n\n🎤 голосовое сообщение"
+    assert comment_text(msg, ZONE) == "👤 **Клиент** · 26.09 23:14\n\n🎤 Голосовое (расшифровка будет ниже)"

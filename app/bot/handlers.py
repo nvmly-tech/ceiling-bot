@@ -1,11 +1,16 @@
 """Диалог квалификации: 4 вопроса → заявка.
 
 Каждое входящее и исходящее сообщение пишется в таблицу messages — из неё потом
-собирается полная переписка для карточки Trello.
+собирается полная переписка для карточки Trello. Голосовые расшифровываются сразу
+(middleware receive_middleware), а если Groq не успел — расшифровка ждёт в очереди.
 """
 
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Any
 
 from aiogram import F, Router
 from aiogram.filters import CommandStart, StateFilter
@@ -22,39 +27,78 @@ from aiogram.types import (
 from app.bot import keyboards, texts
 from app.bot.states import QUESTIONS, Lead, next_question
 from app.config import Settings
-from app.db import TG_CLIENT_MSG, Database, now_iso
+from app.db import STT_TRANSCRIBE, TG_CLIENT_MSG, Database, now_iso
 from app.parsing import normalize_phone, parse_area
+from app.services.stt import SpeechService
 from app.worktime import is_work_time, local_now, manager_eta
 
+log = logging.getLogger(__name__)
+
 SCRIPT = "script"  # подпись модели для ответов по скрипту (без LLM)
+STT_TIMEOUT = 25  # с: сколько клиент ждёт расшифровку, прежде чем бот пойдёт дальше без неё
 
 Markup = InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove | None
 
 
 @dataclass
 class Incoming:
-    kind: str  # text | voice | contact | photo | other
+    kind: str  # text | voice | contact | photo | document | video_note | other
     text: str | None
     file_id: str | None = None
+
+    @property
+    def pending(self) -> bool:
+        """Голосовое, которое ещё не расшифровано."""
+        return self.kind == "voice" and self.text is None
+
+    @property
+    def answer(self) -> str:
+        """Значение для поля анкеты."""
+        return texts.VOICE_PLACEHOLDER if self.pending else (self.text or "")
 
 
 def incoming(message: Message) -> Incoming:
     if message.contact:
         return Incoming("contact", message.contact.phone_number)
     if message.voice:
-        # Этап 4: здесь будет расшифровка через Groq.
-        return Incoming("voice", texts.VOICE_PLACEHOLDER, message.voice.file_id)
+        return Incoming("voice", None, message.voice.file_id)
     if message.text:
         return Incoming("text", message.text)
     if message.photo:
         return Incoming("photo", message.caption, message.photo[-1].file_id)
     if message.document:
         return Incoming("document", message.caption, message.document.file_id)
+    if message.video_note:
+        return Incoming("video_note", None, message.video_note.file_id)
     return Incoming("other", message.caption or f"[{message.content_type}]")
 
 
-async def log_in(db: Database, lead_id: int, item: Incoming) -> None:
-    await db.add_message(lead_id, direction="in", kind=item.kind, text=item.text, file_id=item.file_id)
+async def receive(message: Message, stt: SpeechService | None) -> Incoming:
+    item = incoming(message)
+    if item.kind == "voice" and stt is not None:
+        try:
+            await message.bot.send_chat_action(message.chat.id, "typing")
+            item.text = await asyncio.wait_for(stt.transcribe_file(item.file_id), STT_TIMEOUT)
+        except Exception as e:  # noqa: BLE001 — любая ошибка: расшифруем позже из очереди
+            log.warning("Голосовое не расшифровано сразу (%s), ставлю в очередь", str(e) or type(e).__name__)
+    return item
+
+
+async def receive_middleware(
+    handler: Callable[[Message, dict[str, Any]], Awaitable[Any]], event: Message, data: dict[str, Any]
+) -> Any:
+    """Готовит входящее сообщение (с расшифровкой голосового) для обработчика — аргумент item."""
+    data["item"] = await receive(event, data.get("stt"))
+    return await handler(event, data)
+
+
+async def log_in(db: Database, lead_id: int, item: Incoming, field: str | None = None) -> None:
+    """Записать входящее. Нерасшифрованное голосовое — в очередь; field — поле анкеты, куда лечь тексту."""
+    msg_id = await db.add_message(lead_id, direction="in", kind=item.kind, text=item.text, file_id=item.file_id)
+    if item.pending:
+        await db.enqueue(
+            STT_TRANSCRIBE, lead_id, {"message_id": msg_id, "field": field, "placeholder": texts.VOICE_PLACEHOLDER}
+        )
 
 
 async def say(message: Message, db: Database, lead_id: int, text: str, markup: Markup = None) -> None:
@@ -94,7 +138,7 @@ async def advance(message: Message, state: FSMContext, db: Database, settings: S
     await say(message, db, lead.id, texts.DONE.format(lead_id=lead.id, eta=eta), keyboards.remove())
 
 
-async def start_lead(message: Message, state: FSMContext, db: Database, settings: Settings) -> int:
+async def start_lead(message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming) -> int:
     user = message.from_user
     now = local_now(settings.zone)
     night = not is_work_time(now, settings.work_start, settings.work_end)
@@ -103,7 +147,7 @@ async def start_lead(message: Message, state: FSMContext, db: Database, settings
     )
     await state.set_state(Lead.object)
     await state.set_data({"lead_id": lead.id})
-    await log_in(db, lead.id, incoming(message))
+    await log_in(db, lead.id, item)
     greeting = (
         texts.GREETING_NIGHT.format(name=user.first_name, eta=manager_eta(now, settings.work_start, settings.work_end))
         if night
@@ -117,16 +161,16 @@ async def start_lead(message: Message, state: FSMContext, db: Database, settings
 # --- старт ---
 
 
-async def on_start(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
+async def on_start(message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming) -> None:
     current = await state.get_state()
     lead_id = (await state.get_data()).get("lead_id")
     if lead_id and current in {s.state for s in QUESTIONS}:
         # Анкета не закончена — продолжаем её, а не заводим новый лид.
-        await log_in(db, lead_id, incoming(message))
+        await log_in(db, lead_id, item)
         await say(message, db, lead_id, texts.CONTINUE)
         await ask(message, db, lead_id, next(s for s in QUESTIONS if s.state == current))
         return
-    await start_lead(message, state, db, settings)
+    await start_lead(message, state, db, settings, item)
 
 
 # --- ответы кнопками ---
@@ -170,48 +214,45 @@ async def on_stale_button(cb: CallbackQuery) -> None:
 
 TEXT_OR_VOICE = F.text | F.voice
 
-
-async def on_object_text(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
+async def on_object_text(message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming) -> None:
     lead_id = (await state.get_data())["lead_id"]
-    item = incoming(message)
-    await log_in(db, lead_id, item)
-    await db.update_lead(lead_id, object=item.text)
+    await log_in(db, lead_id, item, "object")
+    await db.update_lead(lead_id, object=item.answer)
     await advance(message, state, db, settings, lead_id)
 
 
-async def on_area_text(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
+async def on_area_text(message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming) -> None:
     data = await state.get_data()
     lead_id = data["lead_id"]
-    item = incoming(message)
-    await log_in(db, lead_id, item)
-    area = parse_area(item.text) if item.kind == "text" else None
-    if area is None and item.kind == "text" and not data.get("area_retry"):
+    await log_in(db, lead_id, item, "area")
+    area = parse_area(item.text) if item.text else None
+    if area is None and not item.pending and not data.get("area_retry"):
         # Переспрашиваем один раз, дальше принимаем как есть — менеджер разберётся.
         await state.update_data(area_retry=True)
         await say(message, db, lead_id, texts.Q_AREA_RETRY, keyboards.areas())
         return
-    await db.update_lead(lead_id, area_m2=area, area_text=item.text)
+    await db.update_lead(lead_id, area_m2=area, area_text=item.answer)
     await advance(message, state, db, settings, lead_id)
 
 
-async def on_ceiling_text(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
+async def on_ceiling_text(
+    message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming
+) -> None:
     lead_id = (await state.get_data())["lead_id"]
-    item = incoming(message)
-    await log_in(db, lead_id, item)
-    await db.update_lead(lead_id, ceiling_type=item.text)
+    await log_in(db, lead_id, item, "ceiling_type")
+    await db.update_lead(lead_id, ceiling_type=item.answer)
     await advance(message, state, db, settings, lead_id)
 
 
-async def on_phone(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
+async def on_phone(message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming) -> None:
     lead_id = (await state.get_data())["lead_id"]
-    item = incoming(message)
-    await log_in(db, lead_id, item)
+    await log_in(db, lead_id, item, "phone")
     if item.kind == "contact":
         phone = normalize_phone(item.text) or item.text
     elif item.kind == "text" and item.text == texts.NO_PHONE:
         phone = texts.NO_PHONE_VALUE
-    elif item.kind == "voice":
-        phone = item.text  # номер разберём из расшифровки (этап 4/5)
+    elif item.pending:
+        phone = item.answer  # номер подставится из расшифровки, когда она будет готова
     else:
         phone = normalize_phone(item.text)
         if phone is None:
@@ -221,21 +262,22 @@ async def on_phone(message: Message, state: FSMContext, db: Database, settings: 
     await advance(message, state, db, settings, lead_id)
 
 
-async def on_measure_time(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
+async def on_measure_time(
+    message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming
+) -> None:
     lead_id = (await state.get_data())["lead_id"]
-    item = incoming(message)
-    await log_in(db, lead_id, item)
-    await db.update_lead(lead_id, measure_time=item.text)
+    await log_in(db, lead_id, item, "measure_time")
+    await db.update_lead(lead_id, measure_time=item.answer)
     await advance(message, state, db, settings, lead_id)
 
 
 # --- после анкеты ---
 
 
-async def on_after_done(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
+async def on_after_done(message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming) -> None:
     data = await state.get_data()
     lead_id = data["lead_id"]
-    await log_in(db, lead_id, incoming(message))
+    await log_in(db, lead_id, item)
     # Несколько сообщений подряд собираем в одно уведомление менеджеру.
     await db.enqueue(TG_CLIENT_MSG, lead_id, coalesce=True, delay=timedelta(seconds=settings.client_msg_delay_sec))
     # Клиенту подтверждаем только первый раз, чтобы не спамить.
@@ -247,19 +289,21 @@ async def on_after_done(message: Message, state: FSMContext, db: Database, setti
 # --- первое сообщение без /start ---
 
 
-async def on_first_message(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
-    await start_lead(message, state, db, settings)
+async def on_first_message(
+    message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming
+) -> None:
+    await start_lead(message, state, db, settings, item)
 
 
 # --- фото/стикеры/документы посреди анкеты ---
 
 
-async def on_other_content(message: Message, state: FSMContext, db: Database) -> None:
+async def on_other_content(message: Message, state: FSMContext, db: Database, item: Incoming) -> None:
     lead_id = (await state.get_data()).get("lead_id")
     current = await state.get_state()
     if lead_id is None or current is None:
         return
-    await log_in(db, lead_id, incoming(message))
+    await log_in(db, lead_id, item)
     await say(message, db, lead_id, texts.NON_TEXT_ACK)
     await ask(message, db, lead_id, next(s for s in QUESTIONS if s.state == current))
 
@@ -270,6 +314,7 @@ def create_router() -> Router:
     # Анкета — только в личке с клиентом; в группе менеджеров бот не задаёт вопросов.
     r.message.filter(F.chat.type == "private")
     r.callback_query.filter(F.message.chat.type == "private")
+    r.message.middleware(receive_middleware)
     r.message.register(on_start, CommandStart())
 
     r.callback_query.register(on_object_button, Lead.object, F.data.startswith("obj:"))

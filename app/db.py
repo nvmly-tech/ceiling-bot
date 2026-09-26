@@ -100,6 +100,9 @@ CARD_CREATE = "trello.card_create"
 CARD_UPDATE = "trello.card_update"
 CARD_COMMENT = "trello.comment"
 CARD_TAKE = "trello.card_take"
+CARD_ATTACH = "trello.attach"          # приложить файл сообщения (голосовое, фото, документ)
+CARD_TRANSCRIPT = "trello.transcript"  # комментарий с отложенной расшифровкой голосового
+STT_TRANSCRIBE = "stt.transcribe"      # отложенная расшифровка голосового
 TG_LEAD = "tg.lead"                # уведомление о новом / брошенном лиде
 TG_REMIND = "tg.remind"            # напоминание: лид никто не взял
 TG_CLIENT_MSG = "tg.client_msg"    # клиент дописал после анкеты
@@ -312,8 +315,14 @@ class Database:
             (lead_id, direction, kind, text, file_id, model, now_iso()),
         )
         await self._enqueue(CARD_COMMENT, lead_id, {"message_id": cur.lastrowid})
+        if file_id:
+            await self._enqueue(CARD_ATTACH, lead_id, {"message_id": cur.lastrowid})
         await self._commit()
         return cur.lastrowid
+
+    async def set_message_text(self, message_id: int, text: str) -> None:
+        await self.conn.execute("UPDATE messages SET text = ? WHERE id = ?", (text, message_id))
+        await self.conn.commit()
 
     async def get_message(self, message_id: int) -> Message | None:
         async with self.conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)) as cur:

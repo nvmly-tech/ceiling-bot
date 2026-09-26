@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+from functools import partial
 
 from aiogram import Bot, Dispatcher
 
@@ -11,29 +12,44 @@ from app.config import Settings, get_settings
 from app.db import Database
 from app.services.notifier import Notifier
 from app.services.outbox import Outbox
+from app.services.stt import FetchFile, GroqTranscriber, SpeechService
+from app.services.tgfiles import download
 from app.services.trello import TrelloClient, TrelloSync
 
 log = logging.getLogger("ceiling-bot")
 
 
-def build_dispatcher(db: Database, settings: Settings, notifier: Notifier | None = None) -> Dispatcher:
+def build_dispatcher(
+    db: Database, settings: Settings, notifier: Notifier | None = None, stt: SpeechService | None = None
+) -> Dispatcher:
     dp = Dispatcher(storage=SQLiteStorage(db))
     dp["db"] = db
     dp["settings"] = settings
     dp["notifier"] = notifier
+    dp["stt"] = stt
     dp.include_router(create_manager_router())
     dp.include_router(create_router())
     return dp
 
 
-def build_trello(db: Database, settings: Settings) -> TrelloSync | None:
+def build_trello(db: Database, settings: Settings, fetch_file: FetchFile | None = None) -> TrelloSync | None:
     if not settings.trello_enabled:
         log.warning("Trello не настроен (TRELLO_API_KEY/TRELLO_TOKEN/TRELLO_BOARD_ID) — задачи копятся в очереди")
         return None
     client = TrelloClient(settings.trello_api_key.get_secret_value(), settings.trello_token.get_secret_value())
     return TrelloSync(
-        db, client, settings.trello_board_id, settings.zone, settings.trello_list_new, settings.trello_list_in_work
+        db, client, settings.trello_board_id, settings.zone, settings.trello_list_new, settings.trello_list_in_work,
+        fetch_file,
     )
+
+
+def build_stt(db: Database, settings: Settings, fetch_file: FetchFile) -> SpeechService | None:
+    key = settings.groq_api_key.get_secret_value().strip() if settings.groq_api_key else ""
+    if not key:
+        log.warning("GROQ_API_KEY не задан — голосовые принимаются без расшифровки, расшифровка ждёт в очереди")
+        return None
+    transcriber = GroqTranscriber(key, settings.groq_base_url, settings.groq_stt_model, settings.groq_stt_language)
+    return SpeechService(db, transcriber, fetch_file)
 
 
 async def run() -> None:
@@ -45,10 +61,14 @@ async def run() -> None:
     db = Database(settings.db_path)
     await db.connect()
     bot = Bot(settings.bot_token.get_secret_value())
-    trello = build_trello(db, settings)
+    fetch_file = partial(download, bot)
+    trello = build_trello(db, settings, fetch_file)
+    stt = build_stt(db, settings, fetch_file)
     notifier = Notifier(bot, db, settings, trello_enabled=trello is not None)
 
     handlers = dict(trello.handlers) if trello else {}
+    if stt:
+        handlers |= stt.handlers
     if settings.manager_chat_id is None:
         log.warning("MANAGER_CHAT_ID не задан — уведомления менеджерам копятся в очереди")
     else:
@@ -59,7 +79,7 @@ async def run() -> None:
         asyncio.create_task(notifier.run(), name="notifier"),
     ]
 
-    dp = build_dispatcher(db, settings, notifier)
+    dp = build_dispatcher(db, settings, notifier, stt)
     try:
         log.info("Bot started, db=%s", settings.db_path)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
@@ -71,6 +91,8 @@ async def run() -> None:
                 await task
         if trello:
             await trello.client.close()
+        if stt:
+            await stt.transcriber.close()
         await bot.session.close()
         await db.close()
 

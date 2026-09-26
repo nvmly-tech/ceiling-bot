@@ -8,10 +8,12 @@ from aiogram.exceptions import TelegramMigrateToChat
 from aiogram.methods import (
     AnswerCallbackQuery,
     EditMessageText,
+    GetFile,
+    SendChatAction,
     SendMessage,
     TelegramMethod,
 )
-from aiogram.types import CallbackQuery, Chat, Contact, Message, Update, User, Voice
+from aiogram.types import CallbackQuery, Chat, Contact, File, Message, PhotoSize, Update, User, Voice
 
 from app.config import Settings
 from app.db import Database
@@ -32,6 +34,7 @@ class FakeSession(BaseSession):
         self.calls: list[TelegramMethod] = []
         self._msg_id = 1000
         self.migrate: dict[int, int] = {}  # chat_id → новый id: имитация превращения группы в супергруппу
+        self.downloads: list[str] = []
 
     async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
         if isinstance(method, SendMessage) and method.chat_id in self.migrate:
@@ -43,12 +46,16 @@ class FakeSession(BaseSession):
             chat_id = method.chat_id or CHAT.id
             chat = CHAT if chat_id == CHAT.id else Chat(id=chat_id, type="group")
             return Message(message_id=self._msg_id, date=datetime.now(UTC), chat=chat, text=method.text)
-        if isinstance(method, AnswerCallbackQuery):
+        if isinstance(method, (AnswerCallbackQuery, SendChatAction)):
             return True
+        if isinstance(method, GetFile):
+            ext = ".jpg" if method.file_id.startswith("photo") else ".oga"
+            return File(file_id=method.file_id, file_unique_id=method.file_id, file_path=f"files/{method.file_id}{ext}")
         raise NotImplementedError(type(method).__name__)
 
-    async def stream_content(self, *args: Any, **kwargs: Any):  # pragma: no cover
-        raise NotImplementedError
+    async def stream_content(self, url: str, *args: Any, **kwargs: Any):
+        self.downloads.append(url)
+        yield b"FILE:" + url.rsplit("/", 1)[-1].encode()
 
     async def close(self) -> None:
         pass
@@ -82,6 +89,10 @@ class Client:
     async def voice(self, file_id: str = "voice-1") -> None:
         voice = Voice(file_id=file_id, file_unique_id=file_id, duration=3)
         await self._feed(message=self._message(voice=voice))
+
+    async def photo(self, file_id: str = "photo-1", caption: str | None = None) -> None:
+        size = PhotoSize(file_id=file_id, file_unique_id=file_id, width=100, height=100)
+        await self._feed(message=self._message(photo=[size], caption=caption))
 
     async def contact(self, phone: str) -> None:
         contact = Contact(phone_number=phone, first_name=USER.first_name, user_id=USER.id)
