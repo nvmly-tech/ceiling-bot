@@ -1,0 +1,16 @@
+[Unit]
+Description=Alert: ceiling-bot nightly backup failed
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/ceiling-bot
+ExecStart=/opt/ceiling-bot/.venv/bin/python -m app.ops.alert backup
+EnvironmentFile=/etc/Solaris/ceiling-bot.env
+Environment=DB_PATH=/var/lib/ceiling-bot/ceiling-bot.sqlite3
+DynamicUser=yes
+User=ceiling-bot
+StateDirectory=ceiling-bot
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

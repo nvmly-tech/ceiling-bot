@@ -2,7 +2,8 @@
 
 - ExecStopPost (`python -m app.ops.alert stop`) — после каждой остановки; при штатной (SERVICE_RESULT=success,
   например systemctl restart при публикации) молчит, иначе сообщает причину: watchdog, код выхода, сигнал;
-- OnFailure-юнит (`python -m app.ops.alert failed`) — systemd исчерпал лимит перезапусков и сдался.
+- OnFailure-юнит (`python -m app.ops.alert failed`) — systemd исчерпал лимит перезапусков и сдался;
+- OnFailure-юнит бэкапа (`python -m app.ops.alert backup`) — ночной бэкап базы не сделан.
 
 Никогда не завершается ошибкой: сбой алерта не должен мешать systemd перезапускать бота.
 """
@@ -30,6 +31,11 @@ REASONS = {
 
 def message(mode: str, env: dict[str, str]) -> str | None:
     rev = escape(revision())
+    if mode == "backup":
+        return (
+            "💾 <b>Ночной бэкап базы ceiling-bot не сделан.</b>\n"
+            f"Причина в логе: <code>journalctl -u ceiling-bot-backup -n 50</code> (версия {rev})"
+        )
     if mode == "failed":
         return (
             "🛑 <b>ceiling-bot остановлен</b>: слишком много падений подряд, systemd больше не перезапускает.\n"

@@ -1,5 +1,7 @@
 [Unit]
 Description=Nightly backup of ceiling-bot database
+# Бэкап не сделан — алерт в Telegram, иначе копии могли бы не создаваться неделями незаметно.
+OnFailure=ceiling-bot-backup-alert.service
 
 [Service]
 Type=oneshot

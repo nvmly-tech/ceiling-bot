@@ -32,7 +32,8 @@ if grep -q '^DB_PATH=' "$ENV_FILE"; then
     echo "!! в $ENV_FILE есть DB_PATH — он перекроет путь к базе из unit-файла; удалите строку, если это не намеренно"
 fi
 
-for unit in $UNIT ceiling-bot-alert.service ceiling-bot-backup.service ceiling-bot-backup.timer; do
+for unit in $UNIT ceiling-bot-alert.service ceiling-bot-backup.service ceiling-bot-backup-alert.service \
+            ceiling-bot-backup.timer; do
     install -m 644 "deploy/$unit" "/etc/systemd/system/$unit"
 done
 systemctl daemon-reload

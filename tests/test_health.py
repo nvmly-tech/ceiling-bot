@@ -314,6 +314,7 @@ def test_alert_messages():
     assert "код 1" in alert.message("stop", {"SERVICE_RESULT": "exit-code", "EXIT_STATUS": "1"})
     assert "сигналом KILL" in alert.message("stop", {"SERVICE_RESULT": "signal", "EXIT_STATUS": "KILL"})
     assert "больше не перезапускает" in alert.message("failed", {})
+    assert "бэкап" in alert.message("backup", {})
 
 
 @respx.mock
@@ -366,3 +367,21 @@ def test_revision_file(tmp_path, monkeypatch):
     assert health.revision() == "dev"
     (tmp_path / "REVISION").write_text("abc123\n")
     assert health.revision() == "abc123"
+
+
+def test_backup_refuses_missing_db(tmp_path):
+    # Нет файла базы — ошибка, а не «успешная» копия пустой базы, которая вытеснит настоящие.
+    dest = tmp_path / "backups"
+    with pytest.raises(sqlite3.OperationalError):
+        backup(tmp_path / "missing.sqlite3", dest)
+    assert not (tmp_path / "missing.sqlite3").exists()
+    assert not list(dest.glob("*.gz"))
+
+
+def test_backup_refuses_db_without_leads(tmp_path):
+    db_path = tmp_path / "bot.sqlite3"
+    sqlite3.connect(db_path).close()  # пустая база: таблиц бота нет
+    dest = tmp_path / "backups"
+    with pytest.raises(RuntimeError, match="leads"):
+        backup(db_path, dest)
+    assert not list(dest.glob("*.gz"))

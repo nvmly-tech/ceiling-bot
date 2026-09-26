@@ -34,15 +34,20 @@ def backup(db: Path = DB, dest: Path = DEST, keep: int = KEEP, now: datetime | N
     target = dest / f"ceiling-bot-{stamp}.sqlite3.gz"
     with tempfile.TemporaryDirectory(dir=dest) as tmp:
         copy = Path(tmp) / "copy.sqlite3"
-        src = sqlite3.connect(db)
+        # mode=ro: если файла базы нет, sqlite3 не создаст пустой, а выдаст ошибку — иначе «успешная» копия
+        # пустой базы вытеснила бы ротацией настоящие.
+        src = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         dst = sqlite3.connect(copy)
         with dst:
             src.backup(dst)
         src.close()
         check = dst.execute("PRAGMA integrity_check").fetchone()[0]
+        has_leads = dst.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'leads'").fetchone()
         dst.close()
         if check != "ok":
             raise RuntimeError(f"копия не прошла integrity_check: {check}")
+        if not has_leads:
+            raise RuntimeError(f"в {db} нет таблицы leads — это не база бота, бэкап не сохраняю")
         with open(copy, "rb") as fin, gzip.open(target, "wb") as fout:
             shutil.copyfileobj(fin, fout)
     target.chmod(0o600)
