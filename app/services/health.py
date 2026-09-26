@@ -118,6 +118,7 @@ class HealthMonitor:
         self.polling_ok: datetime | None = None       # последняя успешная
         self.stt_health = Health()
         self.queue_stuck = False
+        self.queue_unhandled = False  # есть задачи, которые некому выполнить (канал не настроен)
         if llm is not None:
             llm.on_status_change = self._on_llm_change
 
@@ -244,7 +245,7 @@ class HealthMonitor:
                 h.failures, h.down_until, h.last_ok = 0, None, self.clock()
 
     async def check_queue(self) -> None:
-        stats = await self.db.outbox_stats()
+        stats = await self.db.outbox_stats(self.outbox.handlers.keys())
         oldest = stats["oldest_failing_at"]
         stuck = oldest is not None and self.clock() - datetime.fromisoformat(oldest) > QUEUE_STUCK_AFTER
         if stuck and not self.queue_stuck:
@@ -256,6 +257,17 @@ class HealthMonitor:
         elif not stuck and self.queue_stuck:
             await self.alerter.send("✅ Очередь снова проходит")
         self.queue_stuck = stuck
+        await self._check_unhandled(stats)
+
+    async def _check_unhandled(self, stats: dict) -> None:
+        """Задачи без обработчика не падают с ошибкой (attempts = 0) — их ловим по возрасту."""
+        oldest = stats["oldest_unhandled_at"]
+        unhandled = oldest is not None and self.clock() - datetime.fromisoformat(oldest) > QUEUE_STUCK_AFTER
+        if unhandled and not self.queue_unhandled:
+            await self.alerter.send(f"⚠️ {unhandled_line(stats)}")
+        elif not unhandled and self.queue_unhandled:
+            await self.alerter.send("✅ Задачи очереди снова есть кому выполнять")
+        self.queue_unhandled = unhandled
 
     async def run_checks(self) -> None:
         while True:
@@ -292,7 +304,7 @@ class HealthMonitor:
             ("✅ Ядро в порядке" if report.ok else "⛔ " + escape("; ".join(report.problems))),
             f"Telegram: последний успешный опрос {ago(self.polling_ok, now)}",
         ]
-        stats = await self.db.outbox_stats()
+        stats = await self.db.outbox_stats(self.outbox.handlers.keys())
         if stats["pending"] == 0:
             lines.append("Очередь: ✅ пусто")
         else:
@@ -301,6 +313,8 @@ class HealthMonitor:
                 q = ("⚠️ " + q + f", с ошибками {stats['failing']} ({escape(stats['failing_kind'] or '')}): "
                      f"<code>{escape(stats['last_error'] or '')[:150]}</code>")
             lines.append(q)
+            if stats["unhandled"]:
+                lines.append(f"⚠️ {unhandled_line(stats)}")
         if self.llm:
             lines.append("")
             lines.append("<b>LLM</b> (по порядку, дальше — скрипт):")
@@ -327,3 +341,11 @@ class HealthMonitor:
             f"Заявок сегодня: {today['total']} (анкета заполнена: {today['qualified']}, взято: {today['taken']})"
         )
         return "\n".join(lines)
+
+
+def unhandled_line(stats: dict) -> str:
+    kinds = ", ".join(stats["unhandled_kinds"])
+    return (
+        f"В очереди {stats['unhandled']} задач, которые некому выполнить ({escape(kinds)}): канал не настроен — "
+        "проверьте MANAGER_CHAT_ID, ключи Trello и Groq в env-файле"
+    )

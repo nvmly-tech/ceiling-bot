@@ -6,7 +6,7 @@ import httpx
 import pytest
 import respx
 
-from app.db import CARD_COMMENT, CARD_CREATE, CARD_UPDATE, Database
+from app.db import CARD_COMMENT, CARD_CREATE, CARD_UPDATE, TG_LEAD, Database
 from app.services.outbox import Outbox
 from app.services.trello import LABELS, TrelloClient, TrelloError, TrelloSync, card_name, comment_text
 from tests.conftest import USER, Client
@@ -244,3 +244,26 @@ def test_comment_time_in_studio_zone():
     msg = Message(id=1, lead_id=1, direction="in", kind="voice", text=None, file_id="f", model=None,
                   created_at="2026-09-26T20:14:00+00:00")
     assert comment_text(msg, ZONE) == "👤 **Клиент** · 26.09 23:14\n\n🎤 Голосовое (расшифровка будет ниже)"
+
+
+async def test_unhandled_kind_does_not_starve_other_queues(db):
+    # Задачи без обработчика (канал не настроен) копятся — но не должны вытеснять из выборки задачи
+    # работающих каналов (раньше выборка была общей: первые 200 задач).
+    for lead_id in range(1, 301):
+        await db.enqueue(TG_LEAD, lead_id)
+    await db.enqueue(CARD_CREATE, 999)
+    done = []
+
+    async def create(task):
+        done.append(task.lead_id)
+
+    assert await Outbox(db, {CARD_CREATE: create}).run_once() == 1
+    assert done == [999]
+
+
+async def test_outbox_takes_limited_tasks_per_queue(db):
+    for _ in range(50):
+        await db.enqueue(CARD_COMMENT, 1)
+    await db.enqueue(CARD_COMMENT, 2)
+    tasks = await db.outbox_pending(per_queue=20)
+    assert len(tasks) == 21 and tasks[-1].lead_id == 2

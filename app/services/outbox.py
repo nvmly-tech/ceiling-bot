@@ -40,7 +40,8 @@ class Outbox:
         now = now or datetime.now(UTC)
         blocked: set[str] = set()
         done = 0
-        for task in await self.db.outbox_pending():
+        # Задачи без обработчика (канал не настроен) в выборку не попадают — о них говорит сторож.
+        for task in await self.db.outbox_pending(self.handlers.keys()):
             if task.queue is not None and task.queue in blocked:
                 continue
             handler = self.handlers.get(task.kind)

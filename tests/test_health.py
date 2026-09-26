@@ -11,6 +11,7 @@ from aiogram import Bot
 from aiogram.methods import GetUpdates, SendMessage
 
 from app.config import Settings
+from app.db import ALL_KINDS
 from app.main import build_dispatcher
 from app.ops import alert
 from app.services import health, systemd
@@ -23,6 +24,7 @@ from tests.conftest import Client, FakeSession
 from tests.test_llm import FakeProvider
 
 GROUP = -5000
+ADMIN = -7000
 
 
 class Clock:
@@ -66,14 +68,21 @@ class FakeStt:
             raise RuntimeError("Groq: HTTP 503")
 
 
-async def make_monitor(db, *, providers=(), stt=None, admin=None):
+async def noop(task):
+    pass
+
+
+ALL_HANDLED = {kind: noop for kind in ALL_KINDS}
+
+
+async def make_monitor(db, *, providers=(), stt=None, admin=None, handlers=None):
     clock = Clock()
     settings = Settings(bot_token="123:TEST", manager_chat_id=GROUP, admin_chat_id=admin,
                         work_start=time(0), work_end=time(23, 59, 59))
     session = FakeSession()
     bot = Bot("123:TEST", session=session)
     notifier = Notifier(bot, db, settings, trello_enabled=False)
-    outbox = Outbox(db, {})
+    outbox = Outbox(db, ALL_HANDLED if handlers is None else handlers)
     router = LLMRouter(list(providers)) if providers else None
     monitor = HealthMonitor(bot, db, settings, outbox, notifier, Alerter(bot, settings, notifier),
                             llm=router, stt=stt, clock=clock)
@@ -257,6 +266,27 @@ async def test_queue_stuck_alert(db):
     await monitor.check_queue()
     assert alerts(session)[-1] == "✅ Очередь снова проходит"
     assert lead.id == 1
+
+
+async def test_queue_alert_for_tasks_without_handler(db):
+    # Канал не настроен (например, нет MANAGER_CHAT_ID) — его задачи некому выполнить. Ошибок у них нет
+    # (attempts = 0), но сторож всё равно должен об этом сказать.
+    monitor, clock, session, _ = await make_monitor(db, admin=ADMIN, handlers={})
+    clock.now = datetime.now(UTC)
+    await db.create_lead(tg_user_id=1, chat_id=1, name="А", username=None, is_night=False)
+    await monitor.check_queue()
+    assert alerts(session, ADMIN) == []
+
+    clock.tick(minutes=31)
+    await monitor.check_queue()
+    await monitor.check_queue()
+    [alert] = alerts(session, ADMIN)
+    assert "некому выполнить" in alert and "trello.card_create" in alert
+    assert "некому выполнить" in await monitor.status_text()
+
+    monitor.outbox.handlers = ALL_HANDLED
+    await monitor.check_queue()
+    assert alerts(session, ADMIN)[-1] == "✅ Задачи очереди снова есть кому выполнять"
 
 
 # --- перезапуск после сбоя ---

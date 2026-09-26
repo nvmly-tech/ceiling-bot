@@ -4,7 +4,7 @@
 """
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -113,6 +113,8 @@ TG_LEAD = "tg.lead"                # уведомление о новом / бр
 TG_REMIND = "tg.remind"            # напоминание: лид никто не взял
 TG_CLIENT_MSG = "tg.client_msg"    # клиент дописал после анкеты
 TG_DIGEST = "tg.digest"            # утренний дайджест ночных лидов
+ALL_KINDS = (CARD_CREATE, CARD_UPDATE, CARD_COMMENT, CARD_TAKE, CARD_ATTACH, CARD_TRANSCRIPT, STT_TRANSCRIBE,
+             TG_LEAD, TG_REMIND, TG_CLIENT_MSG, TG_DIGEST)
 
 Event = tuple[str, dict[str, Any]]
 
@@ -408,12 +410,23 @@ class Database:
         if self.on_enqueue:
             self.on_enqueue()
 
-    async def outbox_pending(self, limit: int = 200) -> list[OutboxTask]:
-        """Невыполненные задачи в порядке постановки (включая ещё не наступившие ретраи)."""
+    async def outbox_pending(
+        self, kinds: Collection[str] | None = None, *, per_queue: int = 20, limit: int = 1000
+    ) -> list[OutboxTask]:
+        """Невыполненные задачи в порядке постановки (включая ещё не наступившие ретраи).
+        kinds — только задачи с обработчиком: задачи ненастроенного канала не должны занимать выборку.
+        Из каждой очереди — не больше per_queue первых: одна длинная очередь не вытесняет остальные."""
+        where, params = "done_at IS NULL", []
+        if kinds is not None:
+            # Очереди однородны по каналу (trello:<id>, tg:<id>, stt:<id>), поэтому фильтр по виду не ломает порядок.
+            where += f" AND kind IN ({', '.join('?' * len(kinds))})"
+            params = list(kinds)
         async with self.conn.execute(
-            "SELECT id, kind, lead_id, queue, payload, attempts, next_attempt_at, last_error"
-            " FROM outbox WHERE done_at IS NULL ORDER BY id LIMIT ?",
-            (limit,),
+            "SELECT id, kind, lead_id, queue, payload, attempts, next_attempt_at, last_error FROM ("
+            "  SELECT *, ROW_NUMBER() OVER (PARTITION BY COALESCE(queue, 'id:' || id) ORDER BY id) AS pos"
+            f"  FROM outbox WHERE {where}"
+            ") WHERE pos <= ? ORDER BY id LIMIT ?",
+            (*params, per_queue, limit),
         ) as cur:
             rows = await cur.fetchall()
         return [OutboxTask(**{**dict(r), "payload": json.loads(r["payload"])}) for r in rows]
@@ -429,8 +442,9 @@ class Database:
         )
         await self.conn.commit()
 
-    async def outbox_stats(self) -> dict[str, Any]:
-        """Для сторожа и /status: сколько задач ждёт, сколько с ошибками, самая старая ошибочная."""
+    async def outbox_stats(self, handled: Collection[str] | None = None) -> dict[str, Any]:
+        """Для сторожа и /status: сколько задач ждёт, сколько с ошибками, самая старая ошибочная;
+        если передан handled — ещё и задачи, которые некому выполнить (канал не настроен)."""
         async with self.conn.execute(
             "SELECT COUNT(*) AS pending, SUM(attempts > 0) AS failing,"
             " MIN(CASE WHEN attempts > 0 THEN created_at END) AS oldest_failing_at"
@@ -441,12 +455,28 @@ class Database:
             "SELECT kind, last_error FROM outbox WHERE done_at IS NULL AND attempts > 0 ORDER BY id DESC LIMIT 1"
         ) as cur:
             last = await cur.fetchone()
+        unhandled = {"unhandled": 0, "unhandled_kinds": [], "oldest_unhandled_at": None}
+        if handled is not None:
+            async with self.conn.execute(
+                "SELECT kind, COUNT(*) AS n, MIN(created_at) AS oldest FROM outbox"
+                f" WHERE done_at IS NULL AND kind NOT IN ({', '.join('?' * len(handled))})"  # SQLite допускает IN ()
+                " GROUP BY kind ORDER BY kind",
+                list(handled),
+            ) as cur:
+                rows = await cur.fetchall()
+            if rows:
+                unhandled = {
+                    "unhandled": sum(r["n"] for r in rows),
+                    "unhandled_kinds": [r["kind"] for r in rows],
+                    "oldest_unhandled_at": min(r["oldest"] for r in rows),
+                }
         return {
             "pending": row["pending"] or 0,
             "failing": row["failing"] or 0,
             "oldest_failing_at": row["oldest_failing_at"],
             "failing_kind": last["kind"] if last else None,
             "last_error": last["last_error"] if last else None,
+            **unhandled,
         }
 
     async def leads_today(self, zone: Any) -> dict[str, int]:
