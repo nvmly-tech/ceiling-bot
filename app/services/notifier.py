@@ -29,6 +29,9 @@ CARD_WAIT_ATTEMPTS = 3              # сколько раз подождать �
 TG_LIMIT = 4096                     # лимит длины сообщения Telegram
 CLIENT_LINE_MAX = 300               # «клиент дописал»: длина одной строки
 CLIENT_TOTAL_MAX = 3000             # и всех строк вместе
+# Резюме — дополнение, а не суть уведомления. Очередь outbox однопоточная: пока ждём LLM, стоят и Trello,
+# и другие уведомления. Без бюджета две «висящие» модели держали бы её 2×LLM_TIMEOUT_SEC (~30 с).
+SUMMARY_BUDGET = 8                  # с
 
 
 class NotReady(Exception):
@@ -197,9 +200,11 @@ class Notifier:
         if self.assistant is None or lead.summary_status == lead.status:
             return lead
         try:
-            s = await self.assistant.summarize(lead, await self.db.get_messages(lead.id))
-        except LLMError as e:
-            log.warning("Резюме лида %s не получено: %s", lead.id, e)
+            s = await asyncio.wait_for(
+                self.assistant.summarize(lead, await self.db.get_messages(lead.id)), SUMMARY_BUDGET
+            )
+        except (LLMError, TimeoutError) as e:
+            log.warning("Резюме лида %s не получено: %s", lead.id, str(e) or f"не уложились в {SUMMARY_BUDGET} с")
             return lead
         return await self.db.update_lead(
             lead.id, summary=s.summary, hotness=s.hotness, hotness_reason=s.reason, summary_model=s.model,

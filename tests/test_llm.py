@@ -416,3 +416,20 @@ async def test_summary_regenerated_on_status_change(db):
     lead = await db.get_lead(lead.id)
     assert (lead.hotness, lead.summary_status) == ("горячий", "qualified")
     assert len(ds.calls) == 2
+
+
+async def test_hanging_llm_does_not_hold_the_queue(db, monkeypatch):
+    """Обе модели висят — уведомление уходит без резюме в пределах бюджета, очередь не стоит 2×таймаут."""
+    import time as _time
+
+    from app.services import notifier as notifier_mod
+
+    monkeypatch.setattr(notifier_mod, "SUMMARY_BUDGET", 0.2)
+    slow = [FakeProvider("deepseek", SUMMARY, timeout=5, delay=5), FakeProvider("groq", SUMMARY, timeout=5, delay=5)]
+    notifier, outbox, session, _ = await notify_env(db, *slow)
+    await qualified_lead(db)
+    t0 = _time.monotonic()
+    await run_all(notifier, outbox)
+    assert _time.monotonic() - t0 < 2  # без бюджета было бы ~10 с (2 модели × 5 с)
+    msg = session.sent(-5000)[0].text
+    assert "Новая заявка №1" in msg and "резюме" not in msg
