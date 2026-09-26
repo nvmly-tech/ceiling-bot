@@ -26,6 +26,9 @@ Environment=DB_PATH=/var/lib/ceiling-bot/ceiling-bot.sqlite3
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=5
+# Автоперезапуск минует состояние failed: иначе OnFailure («systemd сдался») срабатывал бы при каждом падении.
+# ExecStopPost (алерт с причиной) при этом вызывается.
+RestartMode=direct
 
 # Изоляция: временный пользователь без прав, писать можно только в /var/lib/ceiling-bot.
 DynamicUser=yes
