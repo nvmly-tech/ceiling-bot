@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 from app.db import Database, OutboxTask
+from app.redact import redact
 
 log = logging.getLogger(__name__)
 
@@ -53,8 +54,11 @@ class Outbox:
                 await handler(task)
             except Exception as e:  # noqa: BLE001 — любая ошибка внешнего вызова уходит в ретрай
                 delay = backoff(task.attempts)
-                log.warning("outbox #%s %s (лид %s): %s; повтор через %s", task.id, task.kind, task.lead_id, e, delay)
-                await self.db.outbox_retry(task.id, str(e), (now + delay).isoformat(timespec="seconds"))
+                error = redact(str(e) or type(e).__name__)  # ошибка попадёт в базу и в /status
+                log.warning(
+                    "outbox #%s %s (лид %s): %s; повтор через %s", task.id, task.kind, task.lead_id, error, delay
+                )
+                await self.db.outbox_retry(task.id, error, (now + delay).isoformat(timespec="seconds"))
                 if task.queue is not None:
                     blocked.add(task.queue)
                 continue

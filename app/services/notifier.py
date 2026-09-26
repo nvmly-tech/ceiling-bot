@@ -6,8 +6,9 @@
 
 import asyncio
 import logging
+import re
 from datetime import UTC, datetime, timedelta
-from html import escape
+from html import escape, unescape
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramMigrateToChat
@@ -16,6 +17,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPrevie
 from app.bot.assistant import LeadAssistant
 from app.config import Settings
 from app.db import TG_CLIENT_MSG, TG_DIGEST, TG_LEAD, TG_REMIND, Database, Lead, OutboxTask, now_iso
+from app.parsing import clip
 from app.services.llm import LLMError
 from app.worktime import is_work_time
 
@@ -24,6 +26,9 @@ log = logging.getLogger(__name__)
 KV_CHAT_ID = "manager_chat_id"      # новый id группы после её превращения в супергруппу
 KV_LAST_DIGEST = "last_digest_date"  # дата (по часовому поясу студии) последнего дайджеста
 CARD_WAIT_ATTEMPTS = 3              # сколько раз подождать карточку Trello, прежде чем слать без ссылки
+TG_LIMIT = 4096                     # лимит длины сообщения Telegram
+CLIENT_LINE_MAX = 300               # «клиент дописал»: длина одной строки
+CLIENT_TOTAL_MAX = 3000             # и всех строк вместе
 
 
 class NotReady(Exception):
@@ -155,9 +160,15 @@ class Notifier:
         chat_id = await self.chat_id()
         if chat_id is None:
             raise NotReady("MANAGER_CHAT_ID не задан")
+        parse_mode: str | None = "HTML"
+        if len(text) > TG_LIMIT:
+            # Не должно случаться (поля обрезаны), но длинное сообщение Telegram не примет никогда —
+            # задача застряла бы в очереди. Шлём урезанный простой текст: резать HTML опасно.
+            log.error("Уведомление длиннее %s символов (%s) — отправляю урезанным", TG_LIMIT, len(text))
+            text, parse_mode = clip(unescape(re.sub(r"<[^>]+>", "", text)), TG_LIMIT - 96), None
         kwargs = dict(
             text=text,
-            parse_mode="HTML",
+            parse_mode=parse_mode,
             reply_markup=markup,
             disable_notification=self._silent(),
             link_preview_options=LinkPreviewOptions(is_disabled=True),
@@ -216,13 +227,19 @@ class Notifier:
             return
         lines = [f"💬 <b>№{lead.id} · {escape(lead.name or 'Клиент')} дописал(а) после анкеты:</b>", ""]
         labels = {"voice": "🎤", "photo": "📷 фото", "document": "📎 файл", "video_note": "📹 видео", "contact": "📱"}
-        for m in msgs:
+        total = 0
+        for i, m in enumerate(msgs):
             if m.kind == "text":
                 text = m.text or ""
             elif m.kind == "voice" and not m.text:
                 text = "🎤 голосовое (расшифровка — в карточке)"
             else:
                 text = f"{labels.get(m.kind, m.kind)} {m.text or ''}".strip()
+            text = clip(text, CLIENT_LINE_MAX)
+            if total + len(text) > CLIENT_TOTAL_MAX:
+                lines.append(f"… и ещё сообщений: {len(msgs) - i} — полностью в карточке")
+                break
+            total += len(text)
             lines.append(f"• {escape(text)}")
         if lead.taken_by_name:
             lines.append(f"\nВ работе у {escape(lead.taken_by_name)}")

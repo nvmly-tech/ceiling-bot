@@ -8,6 +8,12 @@ _RANGE_RE = re.compile(_NUM + r"\s*(?:-|–|—|до)\s*(\d+(?:[.,]\d+)?)")
 _NUM_RE = re.compile(_NUM)
 
 AREA_MIN, AREA_MAX = 1.0, 5000.0
+FIELD_MAX = 200  # длина поля анкеты: больше — уведомление менеджеру не влезет в лимит Telegram (4096)
+
+
+def clip(text: str, limit: int = FIELD_MAX) -> str:
+    """Обрезать текст до limit символов с многоточием."""
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def _num(s: str) -> float:

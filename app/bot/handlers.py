@@ -13,7 +13,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from aiogram import F, Router
@@ -34,7 +34,7 @@ from app.bot.assistant import LeadAssistant, missing_fields
 from app.bot.states import QUESTIONS, Lead
 from app.config import Settings
 from app.db import STT_TRANSCRIBE, TG_CLIENT_MSG, Database, now_iso
-from app.parsing import normalize_phone, parse_area
+from app.parsing import clip, normalize_phone, parse_area
 from app.services.llm import LLMError
 from app.services.stt import SpeechService
 from app.worktime import is_work_time, local_now, manager_eta
@@ -44,6 +44,12 @@ log = logging.getLogger(__name__)
 SCRIPT = "script"  # подпись модели для ответов по скрипту (без LLM)
 STT_TIMEOUT = 25  # с: сколько клиент ждёт расшифровку, прежде чем бот пойдёт дальше без неё
 LLM_MAX_STALLS = 2  # столько ответов подряд LLM ничего не извлекла из сообщения — дальше вопрос ведёт скрипт
+
+# Защита от флуда и расхода токенов за счёт студии.
+LLM_RATE_MAX = 8        # сообщений клиента за минуту — больше, и отвечает скрипт, без LLM
+LLM_CALLS_MAX = 40      # обращений к LLM на одну заявку
+LEADS_PER_DAY = 3       # новых заявок от одного человека за сутки; дальше — продолжаем последнюю
+MAX_VOICE_SEC = 300     # голосовые длиннее не расшифровываем: менеджер прослушает вложение
 
 FIELD_STATE = {
     "object": Lead.object,
@@ -62,6 +68,7 @@ class Incoming:
     kind: str  # text | voice | contact | photo | document | video_note | other
     text: str | None
     file_id: str | None = None
+    duration: int = 0  # секунд, для голосовых
 
     @property
     def pending(self) -> bool:
@@ -70,15 +77,15 @@ class Incoming:
 
     @property
     def answer(self) -> str:
-        """Значение для поля анкеты."""
-        return texts.VOICE_PLACEHOLDER if self.pending else (self.text or "")
+        """Значение для поля анкеты (не длиннее FIELD_MAX: клиент может прислать 4096 символов)."""
+        return texts.VOICE_PLACEHOLDER if self.pending else clip(self.text or "")
 
 
 def incoming(message: Message) -> Incoming:
     if message.contact:
         return Incoming("contact", message.contact.phone_number)
     if message.voice:
-        return Incoming("voice", None, message.voice.file_id)
+        return Incoming("voice", None, message.voice.file_id, message.voice.duration or 0)
     if message.text:
         return Incoming("text", message.text)
     if message.photo:
@@ -92,6 +99,9 @@ def incoming(message: Message) -> Incoming:
 
 async def receive(message: Message, stt: SpeechService | None) -> Incoming:
     item = incoming(message)
+    if item.kind == "voice" and item.duration > MAX_VOICE_SEC:
+        item.text = texts.VOICE_TOO_LONG.format(minutes=round(item.duration / 60))
+        return item
     if item.kind == "voice" and stt is not None:
         try:
             await message.bot.send_chat_action(message.chat.id, "typing")
@@ -187,6 +197,7 @@ async def llm_turn(
         last_in = max((i for i, m in enumerate(history) if m.direction == "in"), default=None)
         if last_in is not None:
             history = history[:last_in] + history[last_in + 1 :]
+    await state.update_data(llm_calls=data.get("llm_calls", 0) + 1)
     try:
         await message.bot.send_chat_action(message.chat.id, "typing")
         turn = await assistant.dialog_turn(lead, history, item.text, done=done, eta=done_eta(settings))
@@ -224,6 +235,14 @@ async def start_lead(
     assistant: LeadAssistant | None = None,
 ) -> int:
     user = message.from_user
+    if await db.count_leads_since(user.id, datetime.now(UTC) - timedelta(days=1)) >= LEADS_PER_DAY:
+        # Кто-то жмёт /start по кругу — не плодим карточки и уведомления, продолжаем последнюю заявку.
+        last = await db.last_lead(user.id)
+        await state.set_state(Lead.done)
+        await state.set_data({"lead_id": last.id, "acked": True})
+        await log_in(db, last.id, item)
+        await say(message, db, last.id, texts.LEADS_LIMIT.format(lead_id=last.id), keyboards.remove())
+        return last.id
     now = local_now(settings.zone)
     night = not is_work_time(now, settings.work_start, settings.work_end)
     lead = await db.create_lead(
@@ -280,8 +299,14 @@ async def on_llm_answer(
     ):
         raise SkipHandler
     current = await state.get_state()
-    if current != Lead.done.state and (await state.get_data()).get("llm_stalls", 0) >= LLM_MAX_STALLS:
+    data = await state.get_data()
+    if current != Lead.done.state and data.get("llm_stalls", 0) >= LLM_MAX_STALLS:
         raise SkipHandler
+    if data.get("llm_calls", 0) >= LLM_CALLS_MAX:
+        raise SkipHandler  # лимит обращений к LLM на заявку исчерпан — дальше скрипт
+    minute_ago = datetime.now(UTC) - timedelta(minutes=1)
+    if await db.count_incoming_since(data["lead_id"], minute_ago) >= LLM_RATE_MAX:
+        raise SkipHandler  # флуд — отвечаем скриптом, токены не тратим
     if not await llm_turn(message, state, db, settings, item, assistant):
         raise SkipHandler
 
@@ -295,7 +320,8 @@ async def on_choice(
     code = cb.data.split(":", 1)[1]
     label = options.get(code)
     lead_id = (await state.get_data()).get("lead_id")
-    if label is None or lead_id is None:
+    if label is None or lead_id is None or not isinstance(cb.message, Message):
+        # Неизвестный код (подделанный callback) или сообщение старше 48 ч, которое уже нельзя править.
         await cb.answer()
         return
     await cb.answer()
@@ -361,7 +387,7 @@ async def on_phone(message: Message, state: FSMContext, db: Database, settings: 
     lead_id = (await state.get_data())["lead_id"]
     await log_in(db, lead_id, item, "phone")
     if item.kind == "contact":
-        phone = normalize_phone(item.text) or item.text
+        phone = normalize_phone(item.text) or clip(item.text)
     elif item.kind == "text" and item.text == texts.NO_PHONE:
         phone = texts.NO_PHONE_VALUE
     elif item.pending:

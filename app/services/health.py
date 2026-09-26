@@ -22,6 +22,7 @@ from aiogram.methods import GetUpdates, TelegramMethod
 
 from app.config import Settings
 from app.db import Database
+from app.redact import redact
 from app.services import systemd
 from app.services.llm import FormatError, Health, LLMRouter
 from app.services.notifier import Notifier
@@ -80,6 +81,7 @@ class Alerter:
         return self.settings.admin_chat_id or await self.notifier.chat_id()
 
     async def send(self, text: str) -> None:
+        text = redact(text)  # в алертах бывают тексты ошибок внешних API
         chat_id = await self.chat_id()
         if chat_id is None:
             log.warning("Алерт не отправлен (нет ADMIN_CHAT_ID и MANAGER_CHAT_ID): %s", text)

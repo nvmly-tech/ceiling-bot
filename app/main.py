@@ -5,6 +5,7 @@ from functools import partial
 
 from aiogram import Bot, Dispatcher
 
+from app import redact
 from app.bot.assistant import LeadAssistant
 from app.bot.handlers import create_router
 from app.bot.manager import create_manager_router
@@ -90,6 +91,7 @@ async def run() -> None:
     logging.basicConfig(level=settings.log_level, format="%(levelname)s %(name)s: %(message)s")
     # httpx логирует URL запросов на INFO, а в URL Trello — ключ и токен.
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    redact.install(settings)  # страховка: секреты вырезаются из любых логов и трейсбэков
 
     db = Database(settings.db_path)
     await db.connect()

@@ -5,29 +5,53 @@
 """
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from app.bot import prompts, texts
 from app.db import Lead, Message
-from app.parsing import AREA_MAX, AREA_MIN, normalize_phone, parse_area
+from app.parsing import AREA_MAX, AREA_MIN, clip, normalize_phone, parse_area
 from app.services.llm import LLMRouter
 
 HISTORY_LIMIT = 20       # сообщений переписки в контексте шага диалога
+MESSAGE_MAX = 1000       # символов одного сообщения из истории в контексте LLM
+NEW_MESSAGE_MAX = 2000   # символов нового сообщения клиента (Telegram пускает до 4096 — это токены и деньги)
 SUMMARY_LIMIT = 8000     # символов переписки в контексте резюме
 REPLY_LIMIT = 1500
 HOTNESS = {"горячий": "горячий", "тёплый": "тёплый", "теплый": "тёплый", "холодный": "холодный"}
 
 FIELD_ORDER = list(prompts.FIELDS)  # object, area, ceiling_type, phone, measure_time
 
+# Телефоны клиентов LLM-провайдерам не передаём: бот находит номер сам, модели достаётся «[телефон]».
+PHONE_MASK = "[телефон]"
+_PHONE_CANDIDATE = re.compile(r"\+?\d[\d\s\-()]{8,}\d")
 
-def known_fields(lead: Lead) -> dict[str, str | None]:
+
+def mask_phones(text: str) -> tuple[str, list[str]]:
+    """Текст без номеров телефонов и найденные номера (+7XXXXXXXXXX)."""
+    found: list[str] = []
+
+    def replace(m: re.Match) -> str:
+        phone = normalize_phone(m.group())
+        if phone is None:
+            return m.group()  # не телефон (например, «20 30 40»)
+        found.append(phone)
+        return PHONE_MASK
+
+    return _PHONE_CANDIDATE.sub(replace, text), found
+
+
+def known_fields(lead: Lead, *, mask_phone: bool = False) -> dict[str, str | None]:
     area = lead.area_text or (f"{lead.area_m2:g} м²" if lead.area_m2 is not None else None)
+    phone = lead.phone
+    if mask_phone and phone and phone.startswith("+"):
+        phone = "указан"
     return {
         "object": lead.object,
         "area": area,
         "ceiling_type": lead.ceiling_type,
-        "phone": lead.phone,
+        "phone": phone,
         "measure_time": lead.measure_time,
     }
 
@@ -49,7 +73,7 @@ def _line(m: Message) -> str:
 
 def history_messages(history: list[Message]) -> list[dict[str, str]]:
     return [
-        {"role": "user" if m.direction == "in" else "assistant", "content": _line(m)}
+        {"role": "user" if m.direction == "in" else "assistant", "content": clip(mask_phones(_line(m))[0], MESSAGE_MAX)}
         for m in history[-HISTORY_LIMIT:]
         if _line(m)
     ]
@@ -129,7 +153,7 @@ def parse_summary(data: dict) -> Summary:
 
 
 def transcript(history: list[Message]) -> str:
-    lines = [f"{'Клиент' if m.direction == 'in' else 'Бот'}: {_line(m)}" for m in history if _line(m)]
+    lines = [f"{'Клиент' if m.direction == 'in' else 'Бот'}: {mask_phones(_line(m))[0]}" for m in history if _line(m)]
     text = "\n".join(lines)
     return text[-SUMMARY_LIMIT:]
 
@@ -143,19 +167,24 @@ class LeadAssistant:
     ) -> Turn:
         """Ответ клиенту и поля анкеты из его последнего сообщения. LLMError — ни одна модель не справилась."""
         system = prompts.dialog_system(
-            known_fields(lead), missing_fields(lead) or ["measure_time"], done=done, lead_id=lead.id, eta=eta
+            known_fields(lead, mask_phone=True), missing_fields(lead) or ["measure_time"],
+            done=done, lead_id=lead.id, eta=eta,
         )
         messages = [{"role": "system", "content": system}, *history_messages(history)]
+        phones: list[str] = []
         if new_text is not None:
-            messages.append({"role": "user", "content": new_text})
+            masked, phones = mask_phones(new_text)
+            messages.append({"role": "user", "content": clip(masked, NEW_MESSAGE_MAX)})
         messages.append({"role": "system", "content": prompts.FORMAT_REMINDER})
         turn, model = await self.router.json(messages, parse_turn)
         turn.model = model
+        if phones and "phone" not in turn.updates:
+            turn.updates["phone"] = phones[0]  # номер нашли сами — модель видела только «[телефон]»
         return turn
 
     async def summarize(self, lead: Lead, history: list[Message]) -> Summary:
         status = {"qualified": "анкета заполнена", "abandoned": "анкету не закончил"}.get(lead.status, lead.status)
-        anketa = json.dumps(known_fields(lead), ensure_ascii=False)
+        anketa = json.dumps(known_fields(lead, mask_phone=True), ensure_ascii=False)
         user = f"Статус: {status}.\nАнкета: {anketa}\n\nПереписка:\n{transcript(history)}"
         summary, model = await self.router.json(
             [

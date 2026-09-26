@@ -283,6 +283,19 @@ class Database:
         await self._commit()
         return True
 
+    async def count_leads_since(self, tg_user_id: int, since: datetime) -> int:
+        async with self.conn.execute(
+            "SELECT COUNT(*) FROM leads WHERE tg_user_id = ? AND created_at >= ?", (tg_user_id, now_iso(since))
+        ) as cur:
+            return (await cur.fetchone())[0]
+
+    async def count_incoming_since(self, lead_id: int, since: datetime) -> int:
+        async with self.conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE lead_id = ? AND direction = 'in' AND created_at >= ?",
+            (lead_id, now_iso(since)),
+        ) as cur:
+            return (await cur.fetchone())[0]
+
     async def _leads(self, where: str, params: Sequence[Any] = ()) -> list[Lead]:
         async with self.conn.execute(f"SELECT * FROM leads WHERE {where} ORDER BY id", params) as cur:
             rows = await cur.fetchall()

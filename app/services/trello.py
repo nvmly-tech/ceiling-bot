@@ -6,6 +6,7 @@
 
 import logging
 import mimetypes
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -27,6 +28,7 @@ from app.db import (
     Message,
     OutboxTask,
 )
+from app.services.tgfiles import FileTooLarge
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +49,14 @@ FILE_NAMES = {"voice": "голосовое", "photo": "фото", "document": "�
 DEFAULT_EXT = {"voice": ".ogg", "photo": ".jpg", "video_note": ".mp4"}
 
 FetchFile = Callable[[str], Awaitable[tuple[bytes, str]]]
+
+_MD_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+\-.!|>~<])")
+
+
+def md(text: str | None) -> str:
+    """Экранировать Markdown в чужом тексте (клиент, модель, менеджер): иначе в карточке можно спрятать
+    ссылку под безобидным текстом [Оплатить](http://…) или вставить картинку-трекер ![](…)."""
+    return _MD_SPECIAL.sub(r"\\\1", text or "")
 
 
 class TrelloError(Exception):
@@ -138,7 +148,7 @@ def card_desc(lead: Lead, zone: ZoneInfo) -> str:
     if lead.area_m2 is not None and lead.area_text and f"{lead.area_m2:g}" not in lead.area_text:
         area = f"{lead.area_text} (~{lead.area_m2:g} м²)"
     dash = "—"
-    contact = lead.name or "без имени"
+    contact = md(lead.name) or "без имени"
     if lead.username:
         contact += f", [@{lead.username}](https://t.me/{lead.username})"
     created = _local(lead.created_at, zone)
@@ -146,11 +156,11 @@ def card_desc(lead: Lead, zone: ZoneInfo) -> str:
         f"**Заявка №{lead.id}**" + (" · 🌙 ночная" if lead.is_night else ""),
         f"Статус: {STATUS_NAMES.get(lead.status, lead.status)}",
         "",
-        f"**Объект:** {lead.object or dash}",
-        f"**Площадь:** {area or dash}",
-        f"**Потолок:** {lead.ceiling_type or dash}",
-        f"**Телефон:** {lead.phone or dash}",
-        f"**Замер:** {lead.measure_time or dash}",
+        f"**Объект:** {md(lead.object) or dash}",
+        f"**Площадь:** {md(area) or dash}",
+        f"**Потолок:** {md(lead.ceiling_type) or dash}",
+        f"**Телефон:** {md(lead.phone) or dash}",
+        f"**Замер:** {md(lead.measure_time) or dash}",
         "",
         *summary_lines(lead),
         f"**Клиент в Telegram:** {contact} (ID {lead.tg_user_id})",
@@ -166,24 +176,25 @@ def summary_lines(lead: Lead) -> list[str]:
         return []
     hot = f"**Оценка:** {HOT_ICONS.get(lead.hotness, '')} {lead.hotness}" if lead.hotness else ""
     if hot and lead.hotness_reason:
-        hot += f" — {lead.hotness_reason}"
+        hot += f" — {md(lead.hotness_reason)}"
     lines = [hot] if hot else []
-    return [*lines, f"**Резюме:** {lead.summary}", f"_— резюме: модель {lead.summary_model}_", ""]
+    return [*lines, f"**Резюме:** {md(lead.summary)}", f"_— резюме: модель {lead.summary_model}_", ""]
 
 
 def comment_text(msg: Message, zone: ZoneInfo) -> str:
     when = f"{_local(msg.created_at, zone):%d.%m %H:%M}"
     if msg.direction == "out":
         model = MODEL_NAMES.get(msg.model or "script", msg.model)
-        return f"🤖 **Бот** · {when}\n\n{msg.text}\n\n_— модель: {model}_"
+        return f"🤖 **Бот** · {when}\n\n{md(msg.text)}\n\n_— модель: {model}_"
+    text = md(msg.text)
     body = {
-        "button": f"Нажал кнопку: **{msg.text}**",
-        "contact": f"📱 Поделился номером: {msg.text}",
-        "voice": f"🎤 Голосовое:\n\n> {msg.text}" if msg.text else "🎤 Голосовое (расшифровка будет ниже)",
-        "photo": "📷 Фото" + (f": {msg.text}" if msg.text else "") + " (во вложениях)",
-        "document": "📎 Файл" + (f": {msg.text}" if msg.text else "") + " (во вложениях)",
+        "button": f"Нажал кнопку: **{text}**",
+        "contact": f"📱 Поделился номером: {text}",
+        "voice": f"🎤 Голосовое:\n\n> {text}" if msg.text else "🎤 Голосовое (расшифровка будет ниже)",
+        "photo": "📷 Фото" + (f": {text}" if msg.text else "") + " (во вложениях)",
+        "document": "📎 Файл" + (f": {text}" if msg.text else "") + " (во вложениях)",
         "video_note": "📹 Видеосообщение (во вложениях)",
-    }.get(msg.kind, msg.text or "")
+    }.get(msg.kind, text)
     return f"👤 **Клиент** · {when}\n\n{body}"
 
 
@@ -290,7 +301,7 @@ class TrelloSync:
         board = await self.board()
         card_id = await self._card_id(lead)
         await self.client.update_card(card_id, idList=board.list_in_work)
-        await self.client.add_comment(card_id, f"✅ Взял в работу: **{task.payload['by']}**")
+        await self.client.add_comment(card_id, f"✅ Взял в работу: **{md(task.payload['by'])}**")
 
     async def _message(self, task: OutboxTask) -> Message:
         msg = await self.db.get_message(task.payload["message_id"])
@@ -320,7 +331,7 @@ class TrelloSync:
             mime = mimetypes.guess_type(f"x{ext}")[0] or "application/octet-stream"
             await self.client.add_attachment(card_id, f"{base}_{msg.id}{ext}", content, mime)
         except Exception as e:
-            if task.attempts + 1 < ATTACH_GIVE_UP:
+            if task.attempts + 1 < ATTACH_GIVE_UP and not isinstance(e, FileTooLarge):
                 raise
             log.error("Не удалось приложить %s к карточке лида %s: %s", base, lead.id, e)
             when = f"{_local(msg.created_at, self.zone):%d.%m %H:%M}"
@@ -334,5 +345,5 @@ class TrelloSync:
         if task.payload.get("failed"):
             text = f"🎤 Голосовое от {when}: расшифровать не удалось — прослушайте вложение"
         else:
-            text = f"🎤 Расшифровка голосового от {when}:\n\n> {msg.text}"
+            text = f"🎤 Расшифровка голосового от {when}:\n\n> {md(msg.text)}"
         await self.client.add_comment(await self._card_id(lead), text)

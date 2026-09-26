@@ -24,10 +24,14 @@ def _without_take(markup: InlineKeyboardMarkup | None, lead_id: int) -> InlineKe
 
 
 async def on_take(cb: CallbackQuery, db: Database, settings: Settings, notifier: Notifier) -> None:
-    if cb.message is None or cb.message.chat.id != await notifier.chat_id():
+    if not isinstance(cb.message, Message) or cb.message.chat.id != await notifier.chat_id():
         await cb.answer()
         return
-    lead_id = int(cb.data.split(":", 1)[1])
+    try:
+        lead_id = int(cb.data.split(":", 1)[1])
+    except ValueError:
+        await cb.answer()  # подделанные данные кнопки
+        return
     lead = await db.get_lead(lead_id)
     if lead is None:
         await cb.answer("Заявка не найдена", show_alert=True)
