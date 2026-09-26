@@ -11,7 +11,8 @@ class Settings(BaseSettings):
     """Настройки из окружения. На VPS их задаёт EnvironmentFile=/etc/Solaris/ceiling-bot.env,
     локально — файл .env в корне проекта."""
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    # env_ignore_empty: пустая строка «KEY=» в env-файле означает «не задано» — берётся значение по умолчанию.
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore", env_ignore_empty=True)
 
     bot_token: SecretStr
     db_path: Path = Path("data/ceiling-bot.sqlite3")
@@ -35,6 +36,17 @@ class Settings(BaseSettings):
     groq_base_url: str = "https://api.groq.com/openai/v1"
     groq_stt_model: str = "whisper-large-v3"
     groq_stt_language: str = "ru"
+
+    # LLM: основная модель (DeepSeek через router.cheap) и резервная на Groq (ключ GROQ_API_KEY).
+    llm_primary_name: str = "deepseek (router.cheap)"
+    llm_primary_base_url: str | None = None
+    llm_primary_api_key: SecretStr | None = None
+    llm_primary_model: str | None = None
+    llm_fallback_model: str = "openai/gpt-oss-120b"
+    llm_timeout_sec: float = 15
+
+    # Куда слать алерты сторожа; пусто — в чат менеджеров.
+    admin_chat_id: int | None = None
 
     # Trello. Без ключей бот работает, а задачи для Trello копятся в outbox до появления ключей.
     trello_api_key: SecretStr | None = None
