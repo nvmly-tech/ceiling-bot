@@ -83,16 +83,21 @@ MIGRATIONS = [
     ("leads", "last_reminder_at", "TEXT"),
     ("leads", "client_msgs_notified", "INTEGER NOT NULL DEFAULT 0"),  # id последнего сообщения, о котором сказали
     ("outbox", "queue", "TEXT"),                   # задачи одной очереди выполняются строго по порядку
+    ("leads", "summary", "TEXT"),                  # резюме лида от LLM для менеджера
+    ("leads", "hotness", "TEXT"),                  # горячий | тёплый | холодный
+    ("leads", "hotness_reason", "TEXT"),
+    ("leads", "summary_model", "TEXT"),            # какая модель написала резюме
+    ("leads", "summary_status", "TEXT"),           # для какого статуса лида написано резюме
 ]
 
 # Поля анкеты: их изменение обновляет карточку в Trello.
 CARD_FIELDS = {
     "name", "username", "object", "area_m2", "area_text", "ceiling_type",
-    "phone", "measure_time", "status", "is_night",
+    "phone", "measure_time", "status", "is_night", "summary", "hotness", "hotness_reason", "summary_model",
 }
 LEAD_FIELDS = CARD_FIELDS | {
     "trello_card_id", "trello_card_url", "completed_at", "notified_status", "notified_at",
-    "reminders_sent", "last_reminder_at", "client_msgs_notified",
+    "reminders_sent", "last_reminder_at", "client_msgs_notified", "summary_status",
 }
 
 # Задачи outbox. Префикс до точки — канал: у каждого лида своя очередь на канал.
@@ -143,6 +148,11 @@ class Lead:
     reminders_sent: int = 0
     last_reminder_at: str | None = None
     client_msgs_notified: int = 0
+    summary: str | None = None
+    hotness: str | None = None
+    hotness_reason: str | None = None
+    summary_model: str | None = None
+    summary_status: str | None = None
 
 
 @dataclass

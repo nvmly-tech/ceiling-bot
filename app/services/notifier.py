@@ -13,8 +13,10 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramMigrateToChat
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
+from app.bot.assistant import LeadAssistant
 from app.config import Settings
 from app.db import TG_CLIENT_MSG, TG_DIGEST, TG_LEAD, TG_REMIND, Database, Lead, OutboxTask, now_iso
+from app.services.llm import LLMError
 from app.worktime import is_work_time
 
 log = logging.getLogger(__name__)
@@ -29,6 +31,9 @@ class NotReady(Exception):
 
 
 # --- тексты ---
+
+
+HOT_ICONS = {"горячий": "🔥", "тёплый": "🌤", "холодный": "❄️"}
 
 
 def _area(lead: Lead) -> str | None:
@@ -47,6 +52,12 @@ def lead_body(lead: Lead) -> str:
         lines.append(f"📱 {escape(lead.phone)}")
     if lead.measure_time:
         lines.append(f"🗓 Замер: {escape(lead.measure_time)}")
+    if lead.hotness:
+        reason = f" — {escape(lead.hotness_reason)}" if lead.hotness_reason else ""
+        lines.append(f"{HOT_ICONS.get(lead.hotness, '')} <b>{escape(lead.hotness)}</b>{reason}")
+    if lead.summary:
+        lines.append(f"📝 {escape(lead.summary)}")
+        lines.append(f"<i>— резюме: {escape(lead.summary_model or '')}</i>")
     if lead.trello_card_url:
         lines.append(f'📋 <a href="{escape(lead.trello_card_url)}">Карточка в Trello</a>')
     return "\n".join(lines)
@@ -112,10 +123,14 @@ def next_work_start(moment: datetime, settings: Settings) -> datetime:
 
 
 class Notifier:
-    def __init__(self, bot: Bot, db: Database, settings: Settings, *, trello_enabled: bool, scan_interval: float = 20):
+    def __init__(
+        self, bot: Bot, db: Database, settings: Settings, *, trello_enabled: bool, scan_interval: float = 20,
+        assistant: LeadAssistant | None = None,
+    ):
         self.bot, self.db, self.settings = bot, db, settings
         self.trello_enabled = trello_enabled
         self.scan_interval = scan_interval
+        self.assistant = assistant  # резюме лида от LLM; без него уведомления уходят без резюме
 
     @property
     def handlers(self):
@@ -165,10 +180,25 @@ class Notifier:
 
     # --- задачи outbox ---
 
+    async def _summarize(self, lead: Lead) -> Lead:
+        """Резюме и «горячесть» для текущего статуса лида. Не вышло — уведомление уйдёт без резюме."""
+        if self.assistant is None or lead.summary_status == lead.status:
+            return lead
+        try:
+            s = await self.assistant.summarize(lead, await self.db.get_messages(lead.id))
+        except LLMError as e:
+            log.warning("Резюме лида %s не получено: %s", lead.id, e)
+            return lead
+        return await self.db.update_lead(
+            lead.id, summary=s.summary, hotness=s.hotness, hotness_reason=s.reason, summary_model=s.model,
+            summary_status=lead.status,
+        )
+
     async def send_lead(self, task: OutboxTask) -> None:
         lead = await self._lead(task)
         if lead.taken_at:
             return
+        lead = await self._summarize(lead)
         await self._send(lead_text(lead, task.payload["reason"]), lead_keyboard(lead))
 
     async def send_reminder(self, task: OutboxTask) -> None:

@@ -120,10 +120,14 @@ def _area(lead: Lead) -> str | None:
     return lead.area_text
 
 
+HOT_ICONS = {"горячий": "🔥", "тёплый": "🌤", "холодный": "❄️"}
+
+
 def card_name(lead: Lead) -> str:
     phone = lead.phone if lead.phone and lead.phone.startswith("+") else None
     parts = [lead.name or "Клиент", lead.object, _area(lead), phone]
-    return f"№{lead.id} · " + " · ".join(p for p in parts if p)
+    icon = f"{HOT_ICONS[lead.hotness]} " if lead.hotness in HOT_ICONS else ""
+    return f"{icon}№{lead.id} · " + " · ".join(p for p in parts if p)
 
 
 STATUS_NAMES = {"new": "заполняет анкету", "qualified": "анкета заполнена", "abandoned": "не завершил анкету"}
@@ -148,12 +152,23 @@ def card_desc(lead: Lead, zone: ZoneInfo) -> str:
         f"**Телефон:** {lead.phone or dash}",
         f"**Замер:** {lead.measure_time or dash}",
         "",
+        *summary_lines(lead),
         f"**Клиент в Telegram:** {contact} (ID {lead.tg_user_id})",
         f"**Создана:** {created:%d.%m.%Y %H:%M} ({zone.key})",
         "",
         "Переписка — в комментариях.",
     ]
     return "\n".join(lines)
+
+
+def summary_lines(lead: Lead) -> list[str]:
+    if not lead.summary:
+        return []
+    hot = f"**Оценка:** {HOT_ICONS.get(lead.hotness, '')} {lead.hotness}" if lead.hotness else ""
+    if hot and lead.hotness_reason:
+        hot += f" — {lead.hotness_reason}"
+    lines = [hot] if hot else []
+    return [*lines, f"**Резюме:** {lead.summary}", f"_— резюме: модель {lead.summary_model}_", ""]
 
 
 def comment_text(msg: Message, zone: ZoneInfo) -> str:

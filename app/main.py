@@ -5,11 +5,13 @@ from functools import partial
 
 from aiogram import Bot, Dispatcher
 
+from app.bot.assistant import LeadAssistant
 from app.bot.handlers import create_router
 from app.bot.manager import create_manager_router
 from app.bot.storage import SQLiteStorage
 from app.config import Settings, get_settings
 from app.db import Database
+from app.services.llm import LLMProvider, LLMRouter
 from app.services.notifier import Notifier
 from app.services.outbox import Outbox
 from app.services.stt import FetchFile, GroqTranscriber, SpeechService
@@ -20,13 +22,15 @@ log = logging.getLogger("ceiling-bot")
 
 
 def build_dispatcher(
-    db: Database, settings: Settings, notifier: Notifier | None = None, stt: SpeechService | None = None
+    db: Database, settings: Settings, notifier: Notifier | None = None, stt: SpeechService | None = None,
+    assistant: LeadAssistant | None = None,
 ) -> Dispatcher:
     dp = Dispatcher(storage=SQLiteStorage(db))
     dp["db"] = db
     dp["settings"] = settings
     dp["notifier"] = notifier
     dp["stt"] = stt
+    dp["assistant"] = assistant
     dp.include_router(create_manager_router())
     dp.include_router(create_router())
     return dp
@@ -41,6 +45,32 @@ def build_trello(db: Database, settings: Settings, fetch_file: FetchFile | None 
         db, client, settings.trello_board_id, settings.zone, settings.trello_list_new, settings.trello_list_in_work,
         fetch_file,
     )
+
+
+def build_llm(settings: Settings) -> LLMRouter | None:
+    """Основная модель (router.cheap) и резервная (Groq) — каждая, если для неё всё задано."""
+    providers = []
+    primary_key = settings.llm_primary_api_key.get_secret_value().strip() if settings.llm_primary_api_key else ""
+    if settings.llm_primary_base_url and primary_key and settings.llm_primary_model:
+        providers.append(LLMProvider(
+            settings.llm_primary_name, settings.llm_primary_base_url, primary_key, settings.llm_primary_model,
+            timeout=settings.llm_timeout_sec,
+        ))
+    else:
+        log.warning("Основная LLM не настроена (LLM_PRIMARY_BASE_URL / _API_KEY / _MODEL)")
+    groq_key = settings.groq_api_key.get_secret_value().strip() if settings.groq_api_key else ""
+    if groq_key and settings.llm_fallback_model:
+        # gpt-oss «рассуждает» перед ответом; для диалога хватает минимума — быстрее и дешевле.
+        extra = {"reasoning_effort": "low"} if settings.llm_fallback_model.startswith("openai/gpt-oss") else {}
+        providers.append(LLMProvider(
+            f"groq: {settings.llm_fallback_model}", settings.groq_base_url, groq_key, settings.llm_fallback_model,
+            timeout=settings.llm_timeout_sec, extra=extra,
+        ))
+    if not providers:
+        log.warning("Ни одна LLM не настроена — бот ведёт анкету по скрипту")
+        return None
+    log.info("LLM: %s", " → ".join(p.label for p in providers) + " → скрипт")
+    return LLMRouter(providers)
 
 
 def build_stt(db: Database, settings: Settings, fetch_file: FetchFile) -> SpeechService | None:
@@ -64,7 +94,9 @@ async def run() -> None:
     fetch_file = partial(download, bot)
     trello = build_trello(db, settings, fetch_file)
     stt = build_stt(db, settings, fetch_file)
-    notifier = Notifier(bot, db, settings, trello_enabled=trello is not None)
+    llm = build_llm(settings)
+    assistant = LeadAssistant(llm) if llm else None
+    notifier = Notifier(bot, db, settings, trello_enabled=trello is not None, assistant=assistant)
 
     handlers = dict(trello.handlers) if trello else {}
     if stt:
@@ -79,7 +111,7 @@ async def run() -> None:
         asyncio.create_task(notifier.run(), name="notifier"),
     ]
 
-    dp = build_dispatcher(db, settings, notifier, stt)
+    dp = build_dispatcher(db, settings, notifier, stt, assistant)
     try:
         log.info("Bot started, db=%s", settings.db_path)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
@@ -93,6 +125,8 @@ async def run() -> None:
             await trello.client.close()
         if stt:
             await stt.transcriber.close()
+        if llm:
+            await llm.close()
         await bot.session.close()
         await db.close()
 

@@ -13,9 +13,3 @@ class Lead(StatesGroup):
 # Порядок вопросов анкеты.
 QUESTIONS = [Lead.object, Lead.area, Lead.ceiling_type, Lead.phone, Lead.measure_time]
 
-
-def next_question(state: str | None) -> State:
-    """Следующий вопрос после текущего; после последнего — Lead.done."""
-    names = [s.state for s in QUESTIONS]
-    i = names.index(state)
-    return QUESTIONS[i + 1] if i + 1 < len(QUESTIONS) else Lead.done

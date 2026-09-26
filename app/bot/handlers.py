@@ -3,6 +3,10 @@
 Каждое входящее и исходящее сообщение пишется в таблицу messages — из неё потом
 собирается полная переписка для карточки Trello. Голосовые расшифровываются сразу
 (middleware receive_middleware), а если Groq не успел — расшифровка ждёт в очереди.
+
+Свободный текст и голос сначала обрабатывает LLM (on_llm_answer): отвечает на вопросы клиента
+и извлекает поля анкеты. Если LLM недоступна или дважды не продвинула текущий вопрос —
+SkipHandler, и сообщение обрабатывает скрипт (обработчики ниже), как без LLM.
 """
 
 import asyncio
@@ -13,6 +17,7 @@ from datetime import timedelta
 from typing import Any
 
 from aiogram import F, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
@@ -25,10 +30,12 @@ from aiogram.types import (
 )
 
 from app.bot import keyboards, texts
-from app.bot.states import QUESTIONS, Lead, next_question
+from app.bot.assistant import LeadAssistant, missing_fields
+from app.bot.states import QUESTIONS, Lead
 from app.config import Settings
 from app.db import STT_TRANSCRIBE, TG_CLIENT_MSG, Database, now_iso
 from app.parsing import normalize_phone, parse_area
+from app.services.llm import LLMError
 from app.services.stt import SpeechService
 from app.worktime import is_work_time, local_now, manager_eta
 
@@ -36,6 +43,16 @@ log = logging.getLogger(__name__)
 
 SCRIPT = "script"  # подпись модели для ответов по скрипту (без LLM)
 STT_TIMEOUT = 25  # с: сколько клиент ждёт расшифровку, прежде чем бот пойдёт дальше без неё
+LLM_MAX_STALLS = 2  # столько ответов подряд LLM ничего не извлекла из сообщения — дальше вопрос ведёт скрипт
+
+FIELD_STATE = {
+    "object": Lead.object,
+    "area": Lead.area,
+    "ceiling_type": Lead.ceiling_type,
+    "phone": Lead.phone,
+    "measure_time": Lead.measure_time,
+}
+STATE_FIELD = {s.state: f for f, s in FIELD_STATE.items()}
 
 Markup = InlineKeyboardMarkup | ReplyKeyboardMarkup | ReplyKeyboardRemove | None
 
@@ -87,8 +104,10 @@ async def receive(message: Message, stt: SpeechService | None) -> Incoming:
 async def receive_middleware(
     handler: Callable[[Message, dict[str, Any]], Awaitable[Any]], event: Message, data: dict[str, Any]
 ) -> Any:
-    """Готовит входящее сообщение (с расшифровкой голосового) для обработчика — аргумент item."""
-    data["item"] = await receive(event, data.get("stt"))
+    """Готовит входящее сообщение (с расшифровкой голосового) для обработчика — аргумент item.
+    При SkipHandler следующий обработчик получает те же data — второй раз не расшифровываем."""
+    if "item" not in data:
+        data["item"] = await receive(event, data.get("stt"))
     return await handler(event, data)
 
 
@@ -101,9 +120,12 @@ async def log_in(db: Database, lead_id: int, item: Incoming, field: str | None =
         )
 
 
-async def say(message: Message, db: Database, lead_id: int, text: str, markup: Markup = None) -> None:
+async def say(
+    message: Message, db: Database, lead_id: int, text: str, markup: Markup = None, *, model: str = SCRIPT
+) -> None:
+    """Ответ клиенту. model — кто сформировал текст; клиент подпись не видит, она идёт в Trello и менеджеру."""
     await message.answer(text, reply_markup=markup)
-    await db.add_message(lead_id, direction="out", kind="text", text=text, model=SCRIPT)
+    await db.add_message(lead_id, direction="out", kind="text", text=text, model=model)
 
 
 def question(state: State) -> tuple[str, Markup]:
@@ -121,24 +143,86 @@ async def ask(message: Message, db: Database, lead_id: int, state: State) -> Non
     await say(message, db, lead_id, text, markup)
 
 
-async def advance(message: Message, state: FSMContext, db: Database, settings: Settings, lead_id: int) -> None:
-    """Перейти к следующему вопросу или завершить анкету."""
-    nxt = next_question(await state.get_state())
-    await state.set_state(nxt)
-    if nxt != Lead.done:
-        await ask(message, db, lead_id, nxt)
-        return
-    lead = await db.update_lead(lead_id, status="qualified", completed_at=now_iso())
+def done_eta(settings: Settings) -> str:
     now = local_now(settings.zone)
-    eta = (
-        texts.DONE_ETA_DAY
-        if is_work_time(now, settings.work_start, settings.work_end)
-        else manager_eta(now, settings.work_start, settings.work_end)
-    )
-    await say(message, db, lead.id, texts.DONE.format(lead_id=lead.id, eta=eta), keyboards.remove())
+    if is_work_time(now, settings.work_start, settings.work_end):
+        return texts.DONE_ETA_DAY
+    return manager_eta(now, settings.work_start, settings.work_end)
 
 
-async def start_lead(message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming) -> int:
+async def complete(message: Message, state: FSMContext, db: Database, settings: Settings, lead_id: int) -> None:
+    await state.set_state(Lead.done)
+    lead = await db.update_lead(lead_id, status="qualified", completed_at=now_iso())
+    text = texts.DONE.format(lead_id=lead.id, eta=done_eta(settings))
+    await say(message, db, lead.id, text, keyboards.remove())
+
+
+async def advance(message: Message, state: FSMContext, db: Database, settings: Settings, lead_id: int) -> None:
+    """Следующий вопрос — первое незаполненное поле (LLM могла заполнить несколько сразу), или завершение."""
+    await state.update_data(llm_stalls=0)
+    lead = await db.get_lead(lead_id)
+    missing = missing_fields(lead)
+    if not missing:
+        await complete(message, state, db, settings, lead_id)
+        return
+    nxt = FIELD_STATE[missing[0]]
+    await state.set_state(nxt)
+    await ask(message, db, lead_id, nxt)
+
+
+async def llm_turn(
+    message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming,
+    assistant: LeadAssistant, *, logged: bool = False,
+) -> bool:
+    """Шаг диалога через LLM. False — ни одна модель не справилась, в базе ничего не изменено."""
+    data = await state.get_data()
+    lead_id = data["lead_id"]
+    current = await state.get_state()
+    done = current == Lead.done.state
+    lead = await db.get_lead(lead_id)
+    history = await db.get_messages(lead_id)
+    if logged:
+        # Сообщение уже записано, а после него — приветствие бота. Модели оно нужно последним,
+        # иначе она решит, что уже ответила.
+        last_in = max((i for i, m in enumerate(history) if m.direction == "in"), default=None)
+        if last_in is not None:
+            history = history[:last_in] + history[last_in + 1 :]
+    try:
+        await message.bot.send_chat_action(message.chat.id, "typing")
+        turn = await assistant.dialog_turn(lead, history, item.text, done=done, eta=done_eta(settings))
+    except LLMError as e:
+        log.warning("LLM недоступна, отвечаю по скрипту: %s", e)
+        return False
+
+    if not logged:
+        await log_in(db, lead_id, item, STATE_FIELD.get(current))
+    if turn.updates:
+        lead = await db.update_lead(lead_id, **turn.updates)
+
+    if done:
+        await say(message, db, lead_id, turn.reply, model=turn.model)
+        await db.enqueue(TG_CLIENT_MSG, lead_id, coalesce=True, delay=timedelta(seconds=settings.client_msg_delay_sec))
+        return True
+
+    missing = missing_fields(lead)
+    await state.update_data(llm_stalls=0 if turn.updates else data.get("llm_stalls", 0) + 1)
+    if not missing:
+        # Ответ модели нужен, только если клиент о чём-то спросил, а модель не задаёт вопросов сама.
+        if item.text and "?" in item.text and turn.asks is None:
+            await say(message, db, lead_id, turn.reply, model=turn.model)
+        await complete(message, state, db, settings, lead_id)
+        return True
+    # Переходим к вопросу, который задала модель (чтобы кнопки совпали с вопросом), иначе — к первому недостающему.
+    nxt = FIELD_STATE[turn.asks if turn.asks in missing else missing[0]]
+    await state.set_state(nxt)
+    await say(message, db, lead_id, turn.reply, question(nxt)[1], model=turn.model)
+    return True
+
+
+async def start_lead(
+    message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming,
+    assistant: LeadAssistant | None = None,
+) -> int:
     user = message.from_user
     now = local_now(settings.zone)
     night = not is_work_time(now, settings.work_start, settings.work_end)
@@ -154,14 +238,20 @@ async def start_lead(message: Message, state: FSMContext, db: Database, settings
         else texts.GREETING_DAY.format(name=user.first_name)
     )
     await say(message, db, lead.id, greeting)
-    await ask(message, db, lead.id, Lead.object)
+    # Клиент сразу что-то написал (не /start) — пусть LLM ответит на это и спросит недостающее.
+    free_text = item.kind in ("text", "voice") and item.text and not item.text.startswith("/")
+    if not (free_text and assistant and await llm_turn(message, state, db, settings, item, assistant, logged=True)):
+        await ask(message, db, lead.id, Lead.object)
     return lead.id
 
 
 # --- старт ---
 
 
-async def on_start(message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming) -> None:
+async def on_start(
+    message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming,
+    assistant: LeadAssistant | None = None,
+) -> None:
     current = await state.get_state()
     lead_id = (await state.get_data()).get("lead_id")
     if lead_id and current in {s.state for s in QUESTIONS}:
@@ -170,7 +260,30 @@ async def on_start(message: Message, state: FSMContext, db: Database, settings: 
         await say(message, db, lead_id, texts.CONTINUE)
         await ask(message, db, lead_id, next(s for s in QUESTIONS if s.state == current))
         return
-    await start_lead(message, state, db, settings, item)
+    await start_lead(message, state, db, settings, item, assistant)
+
+
+# --- ответы через LLM ---
+
+
+async def on_llm_answer(
+    message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming,
+    assistant: LeadAssistant | None = None,
+) -> None:
+    if (
+        assistant is None
+        or item.pending
+        or item.kind not in ("text", "voice")
+        or not item.text
+        or item.text.startswith("/")
+        or item.text == texts.NO_PHONE  # кнопка «напишите в Telegram» — детерминированно, скриптом
+    ):
+        raise SkipHandler
+    current = await state.get_state()
+    if current != Lead.done.state and (await state.get_data()).get("llm_stalls", 0) >= LLM_MAX_STALLS:
+        raise SkipHandler
+    if not await llm_turn(message, state, db, settings, item, assistant):
+        raise SkipHandler
 
 
 # --- ответы кнопками ---
@@ -290,9 +403,10 @@ async def on_after_done(message: Message, state: FSMContext, db: Database, setti
 
 
 async def on_first_message(
-    message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming
+    message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming,
+    assistant: LeadAssistant | None = None,
 ) -> None:
-    await start_lead(message, state, db, settings, item)
+    await start_lead(message, state, db, settings, item, assistant)
 
 
 # --- фото/стикеры/документы посреди анкеты ---
@@ -322,6 +436,7 @@ def create_router() -> Router:
     r.callback_query.register(on_ceiling_button, Lead.ceiling_type, F.data.startswith("ct:"))
     r.callback_query.register(on_stale_button)
 
+    r.message.register(on_llm_answer, StateFilter(*QUESTIONS, Lead.done), TEXT_OR_VOICE)
     r.message.register(on_object_text, Lead.object, TEXT_OR_VOICE)
     r.message.register(on_area_text, Lead.area, TEXT_OR_VOICE)
     r.message.register(on_ceiling_text, Lead.ceiling_type, TEXT_OR_VOICE)
