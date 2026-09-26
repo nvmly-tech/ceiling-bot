@@ -188,6 +188,23 @@ async def test_give_up_after_many_attempts(db):
     assert "расшифровать не удалось" in env.trello.cards["C1"]["comments"][-1]
 
 
+async def test_give_up_marks_field_instead_of_placeholder(db):
+    # Телефон голосом, Groq лежит дольше GIVE_UP_ATTEMPTS: заглушка «голосовое сообщение» выглядела бы как
+    # нормальный ответ — поле явно помечается, что номер нужно прослушать.
+    env = Env(db, FakeTranscriber())
+    env.transcriber.up = False
+    await env.to_area()
+    await env.client.press("area:15_30")
+    await env.client.press("ct:matte")
+    await env.client.voice("voice-phone")
+    assert (await db.last_lead(USER.id)).phone == texts.VOICE_PLACEHOLDER
+    now = datetime.now(UTC)
+    for i in range(GIVE_UP_ATTEMPTS + 1):
+        await env.run(now + timedelta(hours=i))
+    assert (await db.last_lead(USER.id)).phone == texts.VOICE_FAILED_VALUE
+    assert texts.VOICE_FAILED_VALUE in env.trello.cards["C1"]["desc"]
+
+
 async def test_without_groq_key_voice_waits_in_queue(db):
     env = Env(db, None)
     await env.to_area()

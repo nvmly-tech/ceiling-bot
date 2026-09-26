@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 
 import httpx
 
+from app.bot import texts
 from app.db import CARD_TRANSCRIPT, STT_TRANSCRIBE, Database, OutboxTask
 from app.parsing import normalize_phone, parse_area
 
@@ -116,15 +117,23 @@ class SpeechService:
             if task.attempts + 1 < GIVE_UP_ATTEMPTS:
                 raise
             log.error("Голосовое %s так и не расшифровано", msg.id)
-            await self.db.enqueue(CARD_TRANSCRIPT, msg.lead_id, {"message_id": msg.id, "failed": True})
+            # Заглушка «голосовое сообщение» в анкете выглядит как ответ — помечаем, что его надо прослушать.
+            events = [(CARD_TRANSCRIPT, {"message_id": msg.id, "failed": True})]
+            field = task.payload.get("field")
+            values = field_value(field, texts.VOICE_FAILED_VALUE) if field else {}
+            await self._fill_field(task, msg.lead_id, events, values)
             return
         await self.db.set_message_text(msg.id, text)
         events = [(CARD_TRANSCRIPT, {"message_id": msg.id})]
         field = task.payload.get("field")
-        lead = await self.db.get_lead(msg.lead_id)
-        # Подставляем расшифровку в анкету, только если там всё ещё заглушка (клиент мог ответить заново).
+        await self._fill_field(task, msg.lead_id, events, field_value(field, text) if field else {})
+
+    async def _fill_field(self, task: OutboxTask, lead_id: int, events: list, values: dict) -> None:
+        """Подставить значение в поле анкеты, только если там всё ещё заглушка (клиент мог ответить заново)."""
+        field = task.payload.get("field")
+        lead = await self.db.get_lead(lead_id)
         current = getattr(lead, "area_text" if field == "area" else field, None) if field and lead else None
         if field and current == task.payload.get("placeholder"):
-            await self.db.update_lead(msg.lead_id, events=events, **field_value(field, text))
+            await self.db.update_lead(lead_id, events=events, **values)
         else:
-            await self.db.update_lead(msg.lead_id, events=events)
+            await self.db.update_lead(lead_id, events=events)
