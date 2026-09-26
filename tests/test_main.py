@@ -1,0 +1,82 @@
+"""Сборка бота (build_app): ошибка в связке компонентов иначе всплыла бы только при запуске на сервере."""
+
+import asyncio
+import logging
+from datetime import time
+
+from aiogram import Bot
+
+from app import db as dbmod
+from app.config import Settings
+from app.main import build_app, build_llm
+from tests.conftest import Client, FakeSession
+
+GROUP = -5000
+FULL = dict(
+    bot_token="123:TEST", manager_chat_id=GROUP, work_start=time(0), work_end=time(23, 59, 59),
+    trello_api_key="trello-key", trello_token="trello-token", trello_board_id="board",
+    groq_api_key="gsk_test_key", llm_primary_base_url="https://router.example/v1",
+    llm_primary_api_key="sk-test-key", llm_primary_model="deepseek-v4.1-flash",
+)
+ALL_KINDS = {v for k, v in vars(dbmod).items() if k.isupper() and isinstance(v, str) and "." in v
+             and v.split(".")[0] in ("trello", "tg", "stt")}
+
+
+async def make(db, **settings):
+    session = FakeSession()
+    app = await build_app(Settings(**settings), Bot("123:TEST", session=session), db)
+    return app, session
+
+
+async def test_full_configuration_is_wired(db):
+    app, session = await make(db, **FULL)
+
+    assert app.trello and app.stt and app.llm
+    labels = [p.label for p in app.llm.providers]
+    assert labels == ["deepseek (router.cheap)", "groq: openai/gpt-oss-120b"]
+    assert app.llm.providers[0].extra == {} and app.llm.providers[1].extra == {"reasoning_effort": "low"}
+    assert app.llm.on_status_change is not None  # алерты сторожа о моделях подключены
+
+    # У каждого вида задач очереди есть обработчик — иначе задачи молча копились бы вечно.
+    assert set(app.outbox.handlers) == ALL_KINDS and len(ALL_KINDS) == 11
+
+    # Сторож видит опрос Telegram через middleware сессии.
+    assert app.monitor.polling_attempt is None
+    await app.bot.get_updates()
+    assert app.monitor.polling_attempt is not None
+
+    # Диспетчер получил все зависимости: /status в группе менеджеров отвечает.
+    await Client(app.dp, app.bot, session).group_text("/status")
+    assert "Состояние бота" in session.sent(GROUP)[-1].text
+    await app.close()
+
+
+async def test_minimal_configuration(db, caplog):
+    caplog.set_level(logging.WARNING)
+    app, session = await make(db, bot_token="123:TEST")
+    assert (app.trello, app.stt, app.llm) == (None, None, None)
+    assert app.outbox.handlers == {}  # задачи копятся до появления настроек
+    for part in ("Trello не настроен", "GROQ_API_KEY не задан", "Ни одна LLM не настроена", "MANAGER_CHAT_ID не задан"):
+        assert part in caplog.text
+    # Анкета по скрипту работает и без интеграций.
+    client = Client(app.dp, app.bot, session)
+    await client.text("/start")
+    assert "1/4" in client.last_text()
+    await app.close()
+
+
+def test_llm_variants():
+    only_groq = build_llm(Settings(bot_token="1:x", groq_api_key="gsk_x_key", llm_fallback_model="qwen/qwen3.8-27b"))
+    assert [(p.label, p.extra) for p in only_groq.providers] == [("groq: qwen/qwen3.8-27b", {})]
+    no_model = build_llm(Settings(bot_token="1:x", llm_primary_base_url="https://r/v1", llm_primary_api_key="sk-x-key"))
+    assert no_model is None  # без имени модели основная не подключается, Groq не настроен
+
+
+async def test_background_tasks_start_and_stop(db):
+    app, _ = await make(db, **FULL)
+    tasks = app.start_tasks()
+    assert [t.get_name() for t in tasks] == ["outbox", "notifier", "watchdog", "checks"]
+    await asyncio.sleep(0.05)
+    assert app.notifier.last_scan is not None and app.outbox.last_run is not None
+    await app.close(tasks)
+    assert all(t.done() for t in tasks)

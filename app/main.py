@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+from dataclasses import dataclass
 from functools import partial
 
 from aiogram import Bot, Dispatcher
@@ -86,16 +87,49 @@ def build_stt(db: Database, settings: Settings, fetch_file: FetchFile) -> Speech
     return SpeechService(db, transcriber, fetch_file)
 
 
-async def run() -> None:
-    settings = get_settings()
-    logging.basicConfig(level=settings.log_level, format="%(levelname)s %(name)s: %(message)s")
-    # httpx логирует URL запросов на INFO, а в URL Trello — ключ и токен.
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    redact.install(settings)  # страховка: секреты вырезаются из любых логов и трейсбэков
+@dataclass
+class App:
+    """Собранный бот: всё, что запускает run(). Отдельно от run(), чтобы сборку можно было проверить в тестах."""
 
-    db = Database(settings.db_path)
-    await db.connect()
-    bot = Bot(settings.bot_token.get_secret_value())
+    bot: Bot
+    db: Database
+    dp: Dispatcher
+    outbox: Outbox
+    notifier: Notifier
+    monitor: HealthMonitor
+    trello: TrelloSync | None
+    stt: SpeechService | None
+    llm: LLMRouter | None
+
+    def start_tasks(self) -> list[asyncio.Task]:
+        return [
+            asyncio.create_task(self.outbox.run(), name="outbox"),
+            asyncio.create_task(self.notifier.run(), name="notifier"),
+            asyncio.create_task(self.monitor.run_watchdog(), name="watchdog"),
+            asyncio.create_task(self.monitor.run_checks(), name="checks"),
+        ]
+
+    async def close(self, tasks: list[asyncio.Task] = ()) -> None:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if self.trello:
+            await self.trello.client.close()
+        if self.stt:
+            await self.stt.transcriber.close()
+        if self.llm:
+            await self.llm.close()
+        await self.bot.session.close()
+        await self.db.close()
+
+
+async def build_app(settings: Settings, bot: Bot | None = None, db: Database | None = None) -> App:
+    if db is None:
+        db = Database(settings.db_path)
+        await db.connect()
+    bot = bot or Bot(settings.bot_token.get_secret_value())
     fetch_file = partial(download, bot)
     trello = build_trello(db, settings, fetch_file)
     stt = build_stt(db, settings, fetch_file)
@@ -117,35 +151,27 @@ async def run() -> None:
         bot, db, settings, outbox, notifier, alerter, llm=llm, stt=stt.transcriber if stt else None
     )
     bot.session.middleware(monitor.session_middleware)
-    await monitor.on_start()
-
-    tasks = [
-        asyncio.create_task(outbox.run(), name="outbox"),
-        asyncio.create_task(notifier.run(), name="notifier"),
-        asyncio.create_task(monitor.run_watchdog(), name="watchdog"),
-        asyncio.create_task(monitor.run_checks(), name="checks"),
-    ]
-
     dp = build_dispatcher(db, settings, notifier, stt, assistant, monitor)
+    return App(bot, db, dp, outbox, notifier, monitor, trello, stt, llm)
+
+
+async def run() -> None:
+    settings = get_settings()
+    logging.basicConfig(level=settings.log_level, format="%(levelname)s %(name)s: %(message)s")
+    # httpx логирует URL запросов на INFO, а в URL Trello — ключ и токен.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    redact.install(settings)  # страховка: секреты вырезаются из любых логов и трейсбэков
+
+    app = await build_app(settings)
+    await app.monitor.on_start()
+    tasks = app.start_tasks()
     try:
         log.info("Bot started, db=%s", settings.db_path)
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await app.dp.start_polling(app.bot, allowed_updates=app.dp.resolve_used_update_types())
     finally:
         systemd.notify("STOPPING=1")
-        await monitor.on_stop()
-        for task in tasks:
-            task.cancel()
-        for task in tasks:
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        if trello:
-            await trello.client.close()
-        if stt:
-            await stt.transcriber.close()
-        if llm:
-            await llm.close()
-        await bot.session.close()
-        await db.close()
+        await app.monitor.on_stop()
+        await app.close(tasks)
 
 
 def main() -> None:

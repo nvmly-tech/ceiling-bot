@@ -9,6 +9,7 @@ from aiogram.methods import (
     AnswerCallbackQuery,
     EditMessageText,
     GetFile,
+    GetUpdates,
     SendChatAction,
     SendMessage,
     TelegramMethod,
@@ -18,6 +19,9 @@ from aiogram.types import CallbackQuery, Chat, Contact, File, Message, PhotoSize
 from app.config import Settings
 from app.db import Database
 from app.main import build_dispatcher
+
+# Тесты не читают .env разработчика с боевыми ключами: всё, что нужно, задаётся явно в каждом тесте.
+Settings.model_config["env_file"] = None
 
 USER = User(id=42, is_bot=False, first_name="Анна", last_name="Петрова", username="anna")
 CHAT = Chat(id=42, type="private")
@@ -48,6 +52,8 @@ class FakeSession(BaseSession):
             return Message(message_id=self._msg_id, date=datetime.now(UTC), chat=chat, text=method.text)
         if isinstance(method, (AnswerCallbackQuery, SendChatAction)):
             return True
+        if isinstance(method, GetUpdates):
+            return []
         if isinstance(method, GetFile):
             ext = ".jpg" if method.file_id.startswith("photo") else ".oga"
             return File(file_id=method.file_id, file_unique_id=method.file_id, file_path=f"files/{method.file_id}{ext}")

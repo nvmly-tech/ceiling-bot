@@ -4,3 +4,5 @@ __pycache__/
 .env
 data/
 *.sqlite3*
+.coverage
+htmlcov/
