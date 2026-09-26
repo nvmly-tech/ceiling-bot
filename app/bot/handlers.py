@@ -47,7 +47,7 @@ LLM_MAX_STALLS = 2  # столько ответов подряд LLM ничег�
 
 # Защита от флуда и расхода токенов за счёт студии.
 LLM_RATE_MAX = 8        # сообщений клиента за минуту — больше, и отвечает скрипт, без LLM
-LLM_CALLS_MAX = 40      # обращений к LLM на одну заявку
+LLM_CALLS_MAX = 40      # обращений к LLM на одну заявку (счётчик в базе — /start его не обнуляет)
 LEADS_PER_DAY = 3       # новых заявок от одного человека за сутки; дальше — продолжаем последнюю
 MAX_VOICE_SEC = 300     # голосовые длиннее не расшифровываем: менеджер прослушает вложение
 
@@ -184,9 +184,12 @@ async def llm_turn(
     message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming,
     assistant: LeadAssistant, *, logged: bool = False,
 ) -> bool:
-    """Шаг диалога через LLM. False — ни одна модель не справилась, в базе ничего не изменено."""
+    """Шаг диалога через LLM. False — бюджет заявки исчерпан или ни одна модель не справилась;
+    тогда в базе ничего не изменено, кроме счётчика обращений."""
     data = await state.get_data()
     lead_id = data["lead_id"]
+    if not await db.spend_llm_call(lead_id, LLM_CALLS_MAX):
+        return False  # лимит обращений к LLM на заявку исчерпан — дальше скрипт
     current = await state.get_state()
     done = current == Lead.done.state
     lead = await db.get_lead(lead_id)
@@ -197,7 +200,6 @@ async def llm_turn(
         last_in = max((i for i, m in enumerate(history) if m.direction == "in"), default=None)
         if last_in is not None:
             history = history[:last_in] + history[last_in + 1 :]
-    await state.update_data(llm_calls=data.get("llm_calls", 0) + 1)
     try:
         await message.bot.send_chat_action(message.chat.id, "typing")
         turn = await assistant.dialog_turn(lead, history, item.text, done=done, eta=done_eta(settings))
@@ -302,8 +304,6 @@ async def on_llm_answer(
     data = await state.get_data()
     if current != Lead.done.state and data.get("llm_stalls", 0) >= LLM_MAX_STALLS:
         raise SkipHandler
-    if data.get("llm_calls", 0) >= LLM_CALLS_MAX:
-        raise SkipHandler  # лимит обращений к LLM на заявку исчерпан — дальше скрипт
     minute_ago = datetime.now(UTC) - timedelta(minutes=1)
     if await db.count_incoming_since(data["lead_id"], minute_ago) >= LLM_RATE_MAX:
         raise SkipHandler  # флуд — отвечаем скриптом, токены не тратим

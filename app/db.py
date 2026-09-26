@@ -88,6 +88,7 @@ MIGRATIONS = [
     ("leads", "hotness_reason", "TEXT"),
     ("leads", "summary_model", "TEXT"),            # какая модель написала резюме
     ("leads", "summary_status", "TEXT"),           # для какого статуса лида написано резюме
+    ("leads", "llm_calls", "INTEGER NOT NULL DEFAULT 0"),  # обращений к LLM по заявке (бюджет токенов)
 ]
 
 # Поля анкеты: их изменение обновляет карточку в Trello.
@@ -153,6 +154,7 @@ class Lead:
     hotness_reason: str | None = None
     summary_model: str | None = None
     summary_status: str | None = None
+    llm_calls: int = 0
 
 
 @dataclass
@@ -295,6 +297,15 @@ class Database:
             (lead_id, now_iso(since)),
         ) as cur:
             return (await cur.fetchone())[0]
+
+    async def spend_llm_call(self, lead_id: int, limit: int) -> bool:
+        """Списать одно обращение к LLM из бюджета заявки. False — бюджет исчерпан.
+        Счётчик в базе, а не в FSM: сброс состояния диалога (/start) его не обнуляет."""
+        cur = await self.conn.execute(
+            "UPDATE leads SET llm_calls = llm_calls + 1 WHERE id = ? AND llm_calls < ?", (lead_id, limit)
+        )
+        await self.conn.commit()
+        return cur.rowcount == 1
 
     async def _leads(self, where: str, params: Sequence[Any] = ()) -> list[Lead]:
         async with self.conn.execute(f"SELECT * FROM leads WHERE {where} ORDER BY id", params) as cur:

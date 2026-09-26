@@ -210,12 +210,33 @@ async def test_llm_budget_per_lead(db):
     ds = FakeProvider("deepseek", *[turn("Какая площадь?")] * 5)
     client, _ = make_client(db, ds)
     await client.text("/start")
-    state_key = next(iter((await db.conn.execute_fetchall("SELECT key FROM fsm"))))[0]
-    _, data = await db.fsm_get(state_key)
-    await db.fsm_set_data(state_key, {**data, "llm_calls": 40})
+    lead = await db.last_lead(USER.id)
+    await db.conn.execute("UPDATE leads SET llm_calls = 40 WHERE id = ?", (lead.id,))
     await client.text("квартира")
     assert ds.calls == []  # лимит исчерпан — отвечает скрипт
     assert client.last_text() == texts.Q_AREA
+
+
+async def test_llm_budget_survives_fsm_reset(db):
+    # Бюджет считается по базе: сброс данных FSM (например, веткой LEADS_PER_DAY на /start) его не обнуляет.
+    ds = FakeProvider("deepseek", *[turn("Какая площадь?")] * 5)
+    client, _ = make_client(db, ds)
+    await client.text("/start")
+    lead = await db.last_lead(USER.id)
+    await db.conn.execute("UPDATE leads SET llm_calls = 40 WHERE id = ?", (lead.id,))
+    state_key = next(iter((await db.conn.execute_fetchall("SELECT key FROM fsm"))))[0]
+    await db.fsm_set_data(state_key, {"lead_id": lead.id})
+    await client.text("квартира")
+    assert ds.calls == []
+
+
+async def test_llm_budget_counts_failed_calls(db):
+    # Неудачное обращение (ошибка, таймаут, не JSON) может тоже стоить токенов — и тоже списывается.
+    ds = FakeProvider("deepseek")  # без заготовленных ответов — отвечает ошибкой
+    client, _ = make_client(db, ds)
+    await client.text("/start")
+    await client.text("квартира")
+    assert ds.calls and (await db.last_lead(USER.id)).llm_calls == 1
 
 
 async def test_new_leads_per_day_limited(db):
