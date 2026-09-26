@@ -4,11 +4,21 @@ After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
 StartLimitBurst=10
+# systemd исчерпал лимит перезапусков — последний алерт.
+OnFailure=ceiling-bot-alert.service
 
 [Service]
-Type=simple
+# Бот сам сообщает о готовности (READY=1) и шлёт «жив» (WATCHDOG=1), только пока ядро здорово.
+# Нет сигнала 60 с — systemd убивает процесс и перезапускает.
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
+TimeoutStartSec=120
+TimeoutStopSec=30
 WorkingDirectory=/opt/ceiling-bot
 ExecStart=/opt/ceiling-bot/.venv/bin/python -m app.main
+# После каждой остановки: при аварийной (watchdog, ошибка, сигнал) — алерт с причиной, при штатной — тишина.
+ExecStopPost=/opt/ceiling-bot/.venv/bin/python -m app.ops.alert stop
 # Секреты: файл читает сам systemd (root), пользователю сервиса доступ к нему не нужен.
 EnvironmentFile=/etc/Solaris/ceiling-bot.env
 # DB_PATH не пишите в env-файл: EnvironmentFile перекрывает Environment.
@@ -19,6 +29,7 @@ RestartSec=5
 
 # Изоляция: временный пользователь без прав, писать можно только в /var/lib/ceiling-bot.
 DynamicUser=yes
+User=ceiling-bot
 StateDirectory=ceiling-bot
 StateDirectoryMode=0700
 ProtectSystem=strict

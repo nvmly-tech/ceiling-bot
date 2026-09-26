@@ -405,6 +405,37 @@ class Database:
         )
         await self.conn.commit()
 
+    async def outbox_stats(self) -> dict[str, Any]:
+        """Для сторожа и /status: сколько задач ждёт, сколько с ошибками, самая старая ошибочная."""
+        async with self.conn.execute(
+            "SELECT COUNT(*) AS pending, SUM(attempts > 0) AS failing,"
+            " MIN(CASE WHEN attempts > 0 THEN created_at END) AS oldest_failing_at"
+            " FROM outbox WHERE done_at IS NULL"
+        ) as cur:
+            row = dict(await cur.fetchone())
+        async with self.conn.execute(
+            "SELECT kind, last_error FROM outbox WHERE done_at IS NULL AND attempts > 0 ORDER BY id DESC LIMIT 1"
+        ) as cur:
+            last = await cur.fetchone()
+        return {
+            "pending": row["pending"] or 0,
+            "failing": row["failing"] or 0,
+            "oldest_failing_at": row["oldest_failing_at"],
+            "failing_kind": last["kind"] if last else None,
+            "last_error": last["last_error"] if last else None,
+        }
+
+    async def leads_today(self, zone: Any) -> dict[str, int]:
+        """Заявки с начала суток по часовому поясу студии."""
+        start = datetime.now(zone).replace(hour=0, minute=0, second=0, microsecond=0)
+        async with self.conn.execute(
+            "SELECT COUNT(*) AS total, SUM(status = 'qualified') AS qualified, SUM(taken_at IS NOT NULL) AS taken"
+            " FROM leads WHERE created_at >= ?",
+            (now_iso(start.astimezone(UTC)),),
+        ) as cur:
+            row = dict(await cur.fetchone())
+        return {k: row[k] or 0 for k in ("total", "qualified", "taken")}
+
     # --- служебные значения ---
 
     async def kv_get(self, key: str) -> str | None:

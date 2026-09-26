@@ -69,9 +69,25 @@ class LLMProvider:
             raise LLMError(f"{self.label}: неожиданный ответ API") from None
         return parse_json(content, self.label)
 
+    async def check_available(self) -> None:
+        """Бесплатная проверка (0 токенов): API доступен, ключ рабочий, модель есть в списке провайдера."""
+        try:
+            resp = await self._http.get("/models")
+        except httpx.HTTPError as e:
+            raise LLMError(f"{self.label}: {type(e).__name__}") from None
+        if resp.status_code >= 400:
+            raise LLMError(f"{self.label}: HTTP {resp.status_code} {resp.text[:200]}")
+        try:
+            ids = {m.get("id") for m in resp.json().get("data", [])}
+        except (ValueError, AttributeError):
+            raise LLMError(f"{self.label}: неожиданный ответ /models") from None
+        if self.model not in ids:
+            raise LLMError(f"{self.label}: модели {self.model} нет в списке провайдера")
+
     async def ping(self) -> None:
-        """Проверка для сторожа (этап 6): ключ рабочий, модель отвечает."""
-        await self.chat_json([{"role": "user", "content": 'Ответь JSON {"ok": true}'}], max_tokens=20, temperature=0)
+        """Настоящий запрос к модели (~25–130 токенов) — сторож делает его, только пока модель помечена упавшей.
+        Запас max_tokens нужен «рассуждающим» моделям (gpt-oss): иначе они не успевают выдать JSON."""
+        await self.chat_json([{"role": "user", "content": 'Ответь JSON {"ok": true}'}], max_tokens=200, temperature=0)
 
 
 def parse_json(content: str, label: str = "llm") -> dict:

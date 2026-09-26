@@ -47,6 +47,9 @@ class Settings(BaseSettings):
 
     # Куда слать алерты сторожа; пусто — в чат менеджеров.
     admin_chat_id: int | None = None
+    # Необязательно: URL внешнего мониторинга (например, healthchecks.io) — сторож пингует его раз в 5 минут,
+    # пока бот здоров. Если перестанет — значит, лежит весь сервер.
+    healthcheck_url: str | None = None
 
     # Trello. Без ключей бот работает, а задачи для Trello копятся в outbox до появления ключей.
     trello_api_key: SecretStr | None = None

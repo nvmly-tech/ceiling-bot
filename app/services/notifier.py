@@ -130,6 +130,7 @@ class Notifier:
         self.bot, self.db, self.settings = bot, db, settings
         self.trello_enabled = trello_enabled
         self.scan_interval = scan_interval
+        self.last_scan: datetime | None = None  # для сторожа
         self.assistant = assistant  # резюме лида от LLM; без него уведомления уходят без резюме
 
     @property
@@ -278,4 +279,5 @@ class Notifier:
                 await self.scan()
             except Exception:
                 log.exception("notifier: сбой планировщика")
+            self.last_scan = datetime.now(UTC)
             await asyncio.sleep(self.scan_interval)

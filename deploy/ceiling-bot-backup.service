@@ -1,0 +1,14 @@
+[Unit]
+Description=Nightly backup of ceiling-bot database
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/ceiling-bot/deploy/backup.py
+# Тот же временный пользователь, что у бота: владелец базы и её служебных файлов не меняется.
+DynamicUser=yes
+User=ceiling-bot
+StateDirectory=ceiling-bot
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes

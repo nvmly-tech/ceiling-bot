@@ -1,13 +1,16 @@
-"""Кнопки в чате менеджеров: «Взял в работу»."""
+"""Чат менеджеров (и админа): кнопка «Взял в работу», команда /status."""
 
 from datetime import datetime
 from html import escape
 
 from aiogram import F, Router
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, LinkPreviewOptions
+from aiogram.dispatcher.event.bases import SkipHandler
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, LinkPreviewOptions, Message
 
 from app.config import Settings
 from app.db import Database
+from app.services.health import HealthMonitor
 from app.services.notifier import Notifier
 
 
@@ -45,7 +48,17 @@ async def on_take(cb: CallbackQuery, db: Database, settings: Settings, notifier:
     )
 
 
+async def on_status(
+    message: Message, settings: Settings, notifier: Notifier, monitor: HealthMonitor | None = None
+) -> None:
+    allowed = {settings.admin_chat_id, await notifier.chat_id()} - {None}
+    if monitor is None or message.chat.id not in allowed:
+        raise SkipHandler  # не наш чат — пусть обработает диалог с клиентом
+    await message.answer(await monitor.status_text(), parse_mode="HTML")
+
+
 def create_manager_router() -> Router:
     r = Router(name="manager")
     r.callback_query.register(on_take, F.data.startswith("take:"))
+    r.message.register(on_status, Command("status"))
     return r

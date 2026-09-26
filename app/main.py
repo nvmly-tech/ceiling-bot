@@ -11,6 +11,8 @@ from app.bot.manager import create_manager_router
 from app.bot.storage import SQLiteStorage
 from app.config import Settings, get_settings
 from app.db import Database
+from app.services import systemd
+from app.services.health import Alerter, HealthMonitor
 from app.services.llm import LLMProvider, LLMRouter
 from app.services.notifier import Notifier
 from app.services.outbox import Outbox
@@ -23,9 +25,10 @@ log = logging.getLogger("ceiling-bot")
 
 def build_dispatcher(
     db: Database, settings: Settings, notifier: Notifier | None = None, stt: SpeechService | None = None,
-    assistant: LeadAssistant | None = None,
+    assistant: LeadAssistant | None = None, monitor: HealthMonitor | None = None,
 ) -> Dispatcher:
     dp = Dispatcher(storage=SQLiteStorage(db))
+    dp["monitor"] = monitor
     dp["db"] = db
     dp["settings"] = settings
     dp["notifier"] = notifier
@@ -106,16 +109,28 @@ async def run() -> None:
     else:
         handlers |= notifier.handlers
     outbox = Outbox(db, handlers)
+
+    alerter = Alerter(bot, settings, notifier)
+    monitor = HealthMonitor(
+        bot, db, settings, outbox, notifier, alerter, llm=llm, stt=stt.transcriber if stt else None
+    )
+    bot.session.middleware(monitor.session_middleware)
+    await monitor.on_start()
+
     tasks = [
         asyncio.create_task(outbox.run(), name="outbox"),
         asyncio.create_task(notifier.run(), name="notifier"),
+        asyncio.create_task(monitor.run_watchdog(), name="watchdog"),
+        asyncio.create_task(monitor.run_checks(), name="checks"),
     ]
 
-    dp = build_dispatcher(db, settings, notifier, stt, assistant)
+    dp = build_dispatcher(db, settings, notifier, stt, assistant, monitor)
     try:
         log.info("Bot started, db=%s", settings.db_path)
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        systemd.notify("STOPPING=1")
+        await monitor.on_stop()
         for task in tasks:
             task.cancel()
         for task in tasks:
