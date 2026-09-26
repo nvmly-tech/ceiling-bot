@@ -50,6 +50,11 @@ LLM_RATE_MAX = 8        # сообщений клиента за минуту �
 LLM_CALLS_MAX = 40      # обращений к LLM на одну заявку (счётчик в базе — /start его не обнуляет)
 LEADS_PER_DAY = 3       # новых заявок от одного человека за сутки; дальше — продолжаем последнюю
 MAX_VOICE_SEC = 300     # голосовые длиннее не расшифровываем: менеджер прослушает вложение
+# Каждое входящее — запись в базе и комментарий в Trello (у голосового ещё вложение и Groq). Сверх этих
+# лимитов на заявку сообщения не сохраняются и никуда не уходят: человек так не пишет, это флуд.
+FLOOD_PER_MIN = 20
+FLOOD_PER_DAY = 300
+FLOOD_NOTICE_EVERY = timedelta(hours=1)  # предупреждение клиенту — не чаще
 
 FIELD_STATE = {
     "object": Lead.object,
@@ -119,6 +124,29 @@ async def receive_middleware(
     if "item" not in data:
         data["item"] = await receive(event, data.get("stt"))
     return await handler(event, data)
+
+
+async def flood_middleware(
+    handler: Callable[[Message, dict[str, Any]], Awaitable[Any]], event: Message, data: dict[str, Any]
+) -> Any:
+    """Отсекает флуд до расшифровки и записи: лишние сообщения не стоят ни места в базе, ни вызовов API."""
+    state: FSMContext | None = data.get("state")
+    db: Database | None = data.get("db")
+    lead_id = (await state.get_data()).get("lead_id") if state else None
+    if lead_id is None or db is None:
+        return await handler(event, data)
+    now = datetime.now(UTC)
+    if (
+        await db.count_incoming_since(lead_id, now - timedelta(minutes=1)) < FLOOD_PER_MIN
+        and await db.count_incoming_since(lead_id, now - timedelta(days=1)) < FLOOD_PER_DAY
+    ):
+        return await handler(event, data)
+    warned = (await state.get_data()).get("flood_warned_at")
+    if warned is None or now - datetime.fromisoformat(warned) >= FLOOD_NOTICE_EVERY:
+        log.warning("Флуд от клиента по заявке %s — сообщения не сохраняются", lead_id)
+        await state.update_data(flood_warned_at=now.isoformat())
+        await event.answer(texts.FLOOD)
+    return None
 
 
 async def log_in(db: Database, lead_id: int, item: Incoming, field: str | None = None) -> None:
@@ -454,6 +482,7 @@ def create_router() -> Router:
     # Анкета — только в личке с клиентом; в группе менеджеров бот не задаёт вопросов.
     r.message.filter(F.chat.type == "private")
     r.callback_query.filter(F.message.chat.type == "private")
+    r.message.outer_middleware(flood_middleware)  # до фильтров и расшифровки: один раз на сообщение
     r.message.middleware(receive_middleware)
     r.message.register(on_start, CommandStart())
 

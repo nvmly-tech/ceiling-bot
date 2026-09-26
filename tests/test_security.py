@@ -11,7 +11,7 @@ from aiogram.methods import GetFile
 from aiogram.types import CallbackQuery, File, InaccessibleMessage
 
 from app import redact
-from app.bot import texts
+from app.bot import handlers, texts
 from app.bot.assistant import PHONE_MASK, LeadAssistant, mask_phones
 from app.config import Settings
 from app.db import STT_TRANSCRIBE, TG_CLIENT_MSG
@@ -205,6 +205,20 @@ async def test_flood_goes_to_script_without_llm(db):
         await client.text(f"вопрос {i}")
     # За минуту от клиента пришло 14 сообщений; к LLM ушли только первые, дальше — без неё.
     assert len(ds.calls) <= 8
+
+
+async def test_message_flood_is_not_stored(db):
+    # Каждое входящее — запись в базе и комментарий в Trello (у голосового ещё вложение и Groq).
+    # Сверх FLOOD_PER_MIN сообщения не сохраняются и никуда не уходят; клиенту — одно предупреждение.
+    client, _ = make_client(db)
+    await client.text("/start")
+    lead = await db.last_lead(USER.id)
+    for i in range(30):
+        await client.text(f"спам {i}")
+    stored = [m for m in await db.get_messages(lead.id) if m.direction == "in"]
+    assert len(stored) == handlers.FLOOD_PER_MIN
+    sent = [m.text for m in client.session.sent(CHAT.id)]
+    assert sent.count(texts.FLOOD) == 1
 
 
 async def test_llm_budget_per_lead(db):
