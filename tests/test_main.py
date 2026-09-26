@@ -80,3 +80,16 @@ async def test_background_tasks_start_and_stop(db):
     assert app.notifier.last_scan is not None and app.outbox.last_run is not None
     await app.close(tasks)
     assert all(t.done() for t in tasks)
+
+
+def test_bad_env_values_fail_at_startup():
+    """Опечатка в .env должна ронять бот при запуске (systemd пришлёт алерт), а не на первом сообщении клиента."""
+    import pytest
+    from pydantic import ValidationError
+
+    for bad in ({}, {"work_start": "9 утра"}, {"manager_chat_id": "группа"}, {"llm_timeout_sec": "долго"},
+                {"studio_tz": "Moscow"}):
+        kw = {"bot_token": "1:x", **bad} if bad else {}
+        with pytest.raises(ValidationError):
+            Settings(**kw)
+    assert Settings(bot_token="1:x", studio_tz="Asia/Yekaterinburg").zone.key == "Asia/Yekaterinburg"

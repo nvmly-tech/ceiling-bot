@@ -3,7 +3,7 @@ from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -61,6 +61,16 @@ class Settings(BaseSettings):
     @property
     def trello_enabled(self) -> bool:
         return bool(self.trello_api_key and self.trello_token and self.trello_board_id)
+
+    @field_validator("studio_tz")
+    @classmethod
+    def _known_tz(cls, value: str) -> str:
+        # Иначе опечатка («Moscow») проходит загрузку, бот стартует и падает на первом же сообщении клиента.
+        try:
+            ZoneInfo(value)
+        except Exception:
+            raise ValueError(f"неизвестный часовой пояс {value!r}, нужен вида Europe/Moscow") from None
+        return value
 
     @property
     def zone(self) -> ZoneInfo:
