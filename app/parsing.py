@@ -1,6 +1,7 @@
 """Разбор свободных ответов клиента: площадь и телефон."""
 
 import re
+from collections.abc import Callable
 
 # Число, перед которым нет буквы/цифры: «м2» и «м²» не дают ложную площадь 2.
 _NUM = r"(?<![\w.,])(\d+(?:[.,]\d+)?)"
@@ -21,7 +22,9 @@ def _num(s: str) -> float:
 
 
 def parse_area(text: str) -> float | None:
-    """Площадь в м² из свободного текста: «18», «около 20 кв.м», «18,5 м2», «20-25» (→ 22.5)."""
+    """Площадь в м² из свободного текста: «18», «около 20 кв.м», «18,5 м2», «20-25» (→ 22.5).
+    Номера телефонов сначала убираются: «8-912-…» иначе читалось бы как диапазон 8–912."""
+    text = replace_phones(text, lambda _phone: " ")
     if m := _RANGE_RE.search(text):
         value = (_num(m.group(1)) + _num(m.group(2))) / 2
     elif m := _NUM_RE.search(text):
@@ -42,3 +45,22 @@ def normalize_phone(text: str) -> str | None:
     if raw.startswith("+") and 10 <= len(digits) <= 15:
         return "+" + digits
     return None
+
+
+# Кандидат в телефон: цифры с пробелами, дефисами, скобками и точками («8912. 345 67 89» — так пишет GigaAM).
+_PHONE_CANDIDATE = re.compile(r"\+?\d[\d\s\-().]{8,}\d")
+
+
+def replace_phones(text: str, repl: Callable[[str], str]) -> str:
+    """Заменить номера телефонов в тексте на repl(номер в формате +7XXXXXXXXXX)."""
+
+    def one(m: re.Match) -> str:
+        chunk = m.group()
+        if phone := normalize_phone(chunk):
+            return repl(phone)
+        if "." in chunk:
+            # «…67 89. 20 метров»: точка — конец предложения, а не часть номера. Проверяем части по отдельности.
+            return ".".join(_PHONE_CANDIDATE.sub(one, part) for part in chunk.split("."))
+        return chunk  # не телефон (например, «20 30 40»)
+
+    return _PHONE_CANDIDATE.sub(one, text)

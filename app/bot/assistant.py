@@ -5,13 +5,12 @@
 """
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Any
 
 from app.bot import prompts, texts
 from app.db import Lead, Message
-from app.parsing import AREA_MAX, AREA_MIN, clip, normalize_phone, parse_area
+from app.parsing import AREA_MAX, AREA_MIN, clip, normalize_phone, parse_area, replace_phones
 from app.services.llm import LLMRouter
 
 HISTORY_LIMIT = 20       # сообщений переписки в контексте шага диалога
@@ -25,21 +24,15 @@ FIELD_ORDER = list(prompts.FIELDS)  # object, area, ceiling_type, phone, measure
 
 # Телефоны клиентов LLM-провайдерам не передаём: бот находит номер сам, модели достаётся «[телефон]».
 PHONE_MASK = "[телефон]"
-_PHONE_CANDIDATE = re.compile(r"\+?\d[\d\s\-()]{8,}\d")
-
-
 def mask_phones(text: str) -> tuple[str, list[str]]:
     """Текст без номеров телефонов и найденные номера (+7XXXXXXXXXX)."""
     found: list[str] = []
 
-    def replace(m: re.Match) -> str:
-        phone = normalize_phone(m.group())
-        if phone is None:
-            return m.group()  # не телефон (например, «20 30 40»)
+    def replace(phone: str) -> str:
         found.append(phone)
         return PHONE_MASK
 
-    return _PHONE_CANDIDATE.sub(replace, text), found
+    return replace_phones(text, replace), found
 
 
 def known_fields(lead: Lead, *, mask_phone: bool = False) -> dict[str, str | None]:

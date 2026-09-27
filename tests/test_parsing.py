@@ -17,6 +17,11 @@ from app.worktime import is_work_time, manager_eta
         ("м2 не знаю", None),
         ("много", None),
         ("0", None),
+        # Номер телефона — не площадь: «8-912» раньше читалось как диапазон 8–912 → 460 м².
+        ("Площадь примерно 18,5 метров, мой номер 8-912-345-67-89", 18.5),
+        ("мой номер 8-912-345-67-89", None),
+        ("звоните +7 (900) 123-45-67, площадь 20-25", 22.5),
+        ("Площадь примерно 18,5 м. Мой номер 8912. 345 67 89", 18.5),  # так пишет GigaAM
     ],
 )
 def test_parse_area(text, expected):
@@ -44,3 +49,15 @@ def test_worktime():
     assert not is_work_time(datetime(2026, 9, 25, 23, 0), start, end)
     assert manager_eta(datetime(2026, 9, 25, 3, 0), start, end) == "сегодня в 9:00"
     assert manager_eta(datetime(2026, 9, 25, 23, 0), start, end) == "завтра в 9:00"
+
+
+def test_mask_phones_with_dot_inside_number():
+    # GigaAM ставит точку внутри продиктованного номера: «8912. 345 67 89».
+    from app.bot.assistant import PHONE_MASK, mask_phones
+
+    assert mask_phones("Мой номер 8912. 345 67 89 Замер в субботу") == (
+        f"Мой номер {PHONE_MASK} Замер в субботу", ["+79123456789"])
+    assert mask_phones("площадь 18.5, 2026 год") == ("площадь 18.5, 2026 год", [])
+    # Точка в конце предложения не склеивает номер со следующим числом.
+    assert mask_phones("номер 8 912 345 67 89. 20 метров") == (f"номер {PHONE_MASK}. 20 метров", ["+79123456789"])
+    assert parse_area("номер 8 912 345 67 89. 20 метров") == 20.0
