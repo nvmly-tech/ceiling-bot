@@ -20,7 +20,7 @@ from app.services.llm import FAIL_THRESHOLD, LLMError, LLMRouter
 from app.services.notifier import Notifier
 from app.services.outbox import Outbox
 from deploy.backup import backup
-from tests.conftest import Client, FakeSession
+from tests.conftest import Client, FakeSession, eventually
 from tests.test_llm import FakeProvider
 
 GROUP = -5000
@@ -176,12 +176,12 @@ async def test_watchdog_pings_only_while_healthy(db, monkeypatch):
     monitor, clock, _, _ = await make_monitor(db)
     monitor.polling_attempt = monitor.outbox.last_run = monitor.notifier.last_scan = clock.now
     task = asyncio.create_task(monitor.run_watchdog())
-    await asyncio.sleep(0.05)
-    assert sent[0] == "READY=1" and "WATCHDOG=1" in sent
+    await eventually(lambda: "WATCHDOG=1" in sent)
+    assert sent[0] == "READY=1"
 
     sent.clear()
     clock.tick(seconds=400)  # всё зависло
-    await asyncio.sleep(0.05)
+    await eventually(lambda: any(m.startswith("STATUS=нездоров") for m in sent))
     task.cancel()
     assert "WATCHDOG=1" not in sent and any(m.startswith("STATUS=нездоров") for m in sent)
 

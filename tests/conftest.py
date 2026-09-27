@@ -1,3 +1,5 @@
+import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime, time
 from typing import Any
 
@@ -124,6 +126,17 @@ class Client:
 
     def last_text(self) -> str:
         return self.session.sent(CHAT.id)[-1].text
+
+
+async def eventually(check: Callable[[], bool], timeout: float = 2.0) -> None:
+    """Дождаться условия от фоновой задачи. Фиксированная пауза (sleep 0.05) под нагрузкой — например,
+    с замером покрытия в deploy.sh — иногда оказывалась короче, и тест случайно падал."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not check():
+        if loop.time() > deadline:
+            raise AssertionError("условие не выполнилось за отведённое время")
+        await asyncio.sleep(0.005)
 
 
 @pytest.fixture

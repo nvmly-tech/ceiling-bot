@@ -29,9 +29,10 @@ class Env:
 
     async def tick(self, now: datetime | None = None) -> None:
         """Один такт фоновых задач: планировщик + очередь."""
-        now = now or datetime.now(UTC)
-        await self.notifier.scan(now)
-        await self.outbox.run_once(now)
+        await self.notifier.scan(now or datetime.now(UTC))
+        # Время для очереди — после scan: задачи, поставленные scan'ом, иначе могли оказаться «из будущего»
+        # (если между замерами сменилась секунда), и тест случайно падал.
+        await self.outbox.run_once(now or datetime.now(UTC))
 
     def group(self):
         return self.session.sent(GROUP)

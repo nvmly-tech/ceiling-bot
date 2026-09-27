@@ -370,10 +370,9 @@ async def qualified_lead(db: Database, status: str = "qualified"):
 
 
 async def run_all(notifier, outbox, now=None):
-    now = now or datetime.now(UTC)
-    await notifier.scan(now)
+    await notifier.scan(now or datetime.now(UTC))
     for _ in range(3):
-        await outbox.run_once(now)
+        await outbox.run_once(now or datetime.now(UTC))  # время — после scan, см. Env.tick в test_notifier
 
 
 async def test_summary_in_notification_and_card(db):

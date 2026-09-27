@@ -19,7 +19,7 @@ from app.services.llm import FormatError, LLMError, LLMProvider
 from app.services.notifier import Notifier
 from app.services.outbox import Outbox
 from app.services.trello import TrelloClient
-from tests.conftest import FakeSession
+from tests.conftest import FakeSession, eventually
 
 API = "https://api.trello.com/1"
 
@@ -152,7 +152,8 @@ async def test_healthcheck_ping_only_when_healthy(db, monkeypatch):
     m.polling_attempt = m.outbox.last_run = m.notifier.last_scan = now
     m.clock = lambda: now
     task = asyncio.create_task(m.run_watchdog())
-    await asyncio.sleep(0.05)
+    await eventually(lambda: route.call_count >= 1)
+    await asyncio.sleep(0.05)  # за это время тактов watchdog много — пинг всё равно один
     task.cancel()
     assert route.call_count == 1  # пинг раз в 5 минут, а не на каждый такт watchdog
 

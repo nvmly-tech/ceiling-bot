@@ -1,6 +1,5 @@
 """Сборка бота (build_app): ошибка в связке компонентов иначе всплыла бы только при запуске на сервере."""
 
-import asyncio
 import logging
 from datetime import time
 
@@ -10,7 +9,7 @@ from app import db as dbmod
 from app.bot import texts
 from app.config import Settings
 from app.main import build_app, build_llm
-from tests.conftest import Client, FakeSession
+from tests.conftest import Client, FakeSession, eventually
 
 GROUP = -5000
 FULL = dict(
@@ -77,8 +76,7 @@ async def test_background_tasks_start_and_stop(db):
     app, _ = await make(db, **FULL)
     tasks = app.start_tasks()
     assert [t.get_name() for t in tasks] == ["outbox", "notifier", "watchdog", "checks"]
-    await asyncio.sleep(0.05)
-    assert app.notifier.last_scan is not None and app.outbox.last_run is not None
+    await eventually(lambda: app.notifier.last_scan is not None and app.outbox.last_run is not None)
     await app.close(tasks)
     assert all(t.done() for t in tasks)
 
