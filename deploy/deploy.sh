@@ -38,11 +38,25 @@ if [ "$CHECK_ONLY" = 1 ]; then
     exit 0
 fi
 
+# Архив собираем заранее и проверяем: пустой архив (например, неверный путь) раньше молча стирал код на сервере.
+ARCHIVE=$(mktemp)
+trap 'rm -f "$ARCHIVE"' EXIT
+# Из корня репозитория: из подпапки git archive кладёт в архив только её же пути — и архив выходит пустым.
+git -C "$(git rev-parse --show-toplevel)" archive --format=tar -o "$ARCHIVE" "HEAD:${PREFIX%/}"
+if ! tar -tf "$ARCHIVE" | grep -qx 'app/main.py'; then
+    echo "!! в архиве нет app/main.py — выкладка отменена, сервер не тронут"
+    exit 1
+fi
+
 echo ">> $HOST: выкладываю $REV"
-git archive --format=tar "HEAD:$PREFIX" | ssh "$HOST" '
+ssh "$HOST" '
     set -e
-    mkdir -p /opt/ceiling-bot && cd /opt/ceiling-bot
+    # Сначала распаковываем рядом и проверяем, только потом заменяем код (.venv и python не трогаем).
+    rm -rf /opt/ceiling-bot.new && mkdir -p /opt/ceiling-bot.new /opt/ceiling-bot
+    tar -x -C /opt/ceiling-bot.new
+    test -f /opt/ceiling-bot.new/app/main.py
+    cd /opt/ceiling-bot
     find . -mindepth 1 -maxdepth 1 ! -name .venv ! -name python -exec rm -rf {} +
-    tar -x
+    cp -a /opt/ceiling-bot.new/. /opt/ceiling-bot/ && rm -rf /opt/ceiling-bot.new
     echo '"$REV"' > REVISION
-    bash deploy/install.sh'
+    bash deploy/install.sh' < "$ARCHIVE"
