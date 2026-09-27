@@ -43,7 +43,8 @@ ARCHIVE=$(mktemp)
 trap 'rm -f "$ARCHIVE"' EXIT
 # Из корня репозитория: из подпапки git archive кладёт в архив только её же пути — и архив выходит пустым.
 git -C "$(git rev-parse --show-toplevel)" archive --format=tar -o "$ARCHIVE" "HEAD:${PREFIX%/}"
-if ! tar -tf "$ARCHIVE" | grep -qx 'app/main.py'; then
+# Без grep -q: он выходит на первой находке, tar получает SIGPIPE, и при pipefail проверка «проваливается».
+if ! tar -tf "$ARCHIVE" | grep -x 'app/main.py' >/dev/null; then
     echo "!! в архиве нет app/main.py — выкладка отменена, сервер не тронут"
     exit 1
 fi
