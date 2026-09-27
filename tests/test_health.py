@@ -60,7 +60,8 @@ class CheckedProvider(FakeProvider):
 
 
 class FakeStt:
-    def __init__(self):
+    def __init__(self, label: str = "Groq"):
+        self.label = label
         self.ok = True
 
     async def ping(self):
@@ -243,6 +244,24 @@ async def test_stt_alerts(db):
     await monitor.check_models()
     assert alerts(session)[-1] == "✅ Расшифровка голосовых (Groq) снова работает"
 
+
+
+async def test_stt_two_models_alert_separately_and_status_compares(db):
+    giga, groq = FakeStt("GigaAM"), FakeStt("Groq")
+    monitor, _, session, _ = await make_monitor(db, stt=[giga, groq])
+    giga.ok = False
+    for _ in range(3):
+        await monitor.check_models()
+    [alert] = alerts(session)
+    assert "Расшифровка голосовых (GigaAM) недоступна — работает запасная модель" in alert
+
+    lead = await db.create_lead(tg_user_id=1, chat_id=1, name="А", username=None, is_night=False)
+    msg_id = await db.add_message(lead.id, direction="in", kind="voice", text="хочу глянцевый потолок",
+                                  file_id="v", model="GigaAM")
+    await db.set_message_alt(msg_id, "Хочу глянцевый потолок.", "Groq")
+    text = await monitor.status_text()
+    assert "Расшифровка голосовых: GigaAM ⛔ недоступна, Groq ✅" in text
+    assert "Сравнение расшифровок за 14 дн.: 1 голосовых, совпадение ~100%" in text
 
 # --- очередь ---
 

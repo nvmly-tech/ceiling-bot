@@ -33,7 +33,7 @@ from app.bot import keyboards, texts
 from app.bot.assistant import LeadAssistant, missing_fields
 from app.bot.states import QUESTIONS, Lead
 from app.config import Settings
-from app.db import STT_TRANSCRIBE, TG_CLIENT_MSG, Database, now_iso
+from app.db import STT_SHADOW, STT_TRANSCRIBE, TG_CLIENT_MSG, Database, now_iso
 from app.parsing import clip, normalize_phone, parse_area
 from app.services.llm import LLMError
 from app.services.stt import SpeechService
@@ -74,6 +74,8 @@ class Incoming:
     text: str | None
     file_id: str | None = None
     duration: int = 0  # секунд, для голосовых
+    stt_model: str | None = None  # какая модель расшифровала голосовое
+    shadow: bool = False  # после записи — теневая расшифровка другой моделью (для сравнения)
 
     @property
     def pending(self) -> bool:
@@ -110,7 +112,9 @@ async def receive(message: Message, stt: SpeechService | None) -> Incoming:
     if item.kind == "voice" and stt is not None:
         try:
             await message.bot.send_chat_action(message.chat.id, "typing")
-            item.text = await asyncio.wait_for(stt.transcribe_file(item.file_id), STT_TIMEOUT)
+            # Модели делят STT_TIMEOUT между собой; внешний таймаут — страховка на скачивание файла.
+            result = await asyncio.wait_for(stt.transcribe(item.file_id, STT_TIMEOUT), STT_TIMEOUT + 5)
+            item.text, item.stt_model, item.shadow = result.text, result.model, stt.shadow
         except Exception as e:  # noqa: BLE001 — любая ошибка: расшифруем позже из очереди
             log.warning("Голосовое не расшифровано сразу (%s), ставлю в очередь", str(e) or type(e).__name__)
     return item
@@ -151,7 +155,11 @@ async def flood_middleware(
 
 async def log_in(db: Database, lead_id: int, item: Incoming, field: str | None = None) -> None:
     """Записать входящее. Нерасшифрованное голосовое — в очередь; field — поле анкеты, куда лечь тексту."""
-    msg_id = await db.add_message(lead_id, direction="in", kind=item.kind, text=item.text, file_id=item.file_id)
+    msg_id = await db.add_message(
+        lead_id, direction="in", kind=item.kind, text=item.text, file_id=item.file_id, model=item.stt_model
+    )
+    if item.shadow:
+        await db.enqueue(STT_SHADOW, lead_id, {"message_id": msg_id})
     if item.pending:
         await db.enqueue(
             STT_TRANSCRIBE, lead_id, {"message_id": msg_id, "field": field, "placeholder": texts.VOICE_PLACEHOLDER}

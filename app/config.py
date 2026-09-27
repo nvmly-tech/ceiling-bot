@@ -31,7 +31,13 @@ class Settings(BaseSettings):
     remind_max: int = 3               # сколько раз напоминать
     client_msg_delay_sec: int = 60    # сообщения клиента после анкеты собираем в одно уведомление
 
-    # Groq: расшифровка голосовых. Без ключа голосовые принимаются как ответ, а расшифровка ждёт в очереди.
+    # Расшифровка голосовых. Основная — GigaAM на этом же сервере (сервис ceiling-bot-stt, deploy/stt):
+    # путь к его сокету; пусто — не используется. Резервная — Groq (GROQ_API_KEY).
+    # Нет ни одной — голосовые принимаются как ответ, а расшифровка ждёт в очереди.
+    gigaam_socket: str = ""
+    gigaam_timeout_sec: float = 60
+    # Теневое сравнение: голосовое расшифровывает и вторая модель, текст — только в базу (для оценки качества).
+    stt_shadow: bool = True
     groq_api_key: SecretStr | None = None
     groq_base_url: str = "https://api.groq.com/openai/v1"
     groq_stt_model: str = "whisper-large-v3"

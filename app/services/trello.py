@@ -181,6 +181,11 @@ def summary_lines(lead: Lead) -> list[str]:
     return [*lines, f"**Резюме:** {md(lead.summary)}", f"_— резюме: модель {lead.summary_model}_", ""]
 
 
+def stt_signature(msg: Message) -> str:
+    """Какая модель расшифровала голосовое — как подпись модели под ответами бота, видно только в Trello."""
+    return f"\n\n_— расшифровка: {md(msg.model)}_" if msg.model else ""
+
+
 def comment_text(msg: Message, zone: ZoneInfo) -> str:
     when = f"{_local(msg.created_at, zone):%d.%m %H:%M}"
     if msg.direction == "out":
@@ -190,7 +195,8 @@ def comment_text(msg: Message, zone: ZoneInfo) -> str:
     body = {
         "button": f"Нажал кнопку: **{text}**",
         "contact": f"📱 Поделился номером: {text}",
-        "voice": f"🎤 Голосовое:\n\n> {text}" if msg.text else "🎤 Голосовое (расшифровка будет ниже)",
+        "voice": (f"🎤 Голосовое:\n\n> {text}{stt_signature(msg)}" if msg.text
+                  else "🎤 Голосовое (расшифровка будет ниже)"),
         "photo": "📷 Фото" + (f": {text}" if msg.text else "") + " (во вложениях)",
         "document": "📎 Файл" + (f": {text}" if msg.text else "") + " (во вложениях)",
         "video_note": "📹 Видеосообщение (во вложениях)",
@@ -345,5 +351,5 @@ class TrelloSync:
         if task.payload.get("failed"):
             text = f"🎤 Голосовое от {when}: расшифровать не удалось — прослушайте вложение"
         else:
-            text = f"🎤 Расшифровка голосового от {when}:\n\n> {md(msg.text)}"
+            text = f"🎤 Расшифровка голосового от {when}:\n\n> {md(msg.text)}{stt_signature(msg)}"
         await self.client.add_comment(await self._card_id(lead), text)

@@ -18,7 +18,14 @@ from app.services.health import Alerter, HealthMonitor
 from app.services.llm import LLMProvider, LLMRouter
 from app.services.notifier import Notifier
 from app.services.outbox import Outbox
-from app.services.stt import FetchFile, GroqTranscriber, SpeechService
+from app.services.stt import (
+    FetchFile,
+    GigaAMTranscriber,
+    GroqTranscriber,
+    SpeechService,
+    Transcriber,
+    model_label,
+)
 from app.services.tgfiles import download
 from app.services.trello import TrelloClient, TrelloSync
 
@@ -79,12 +86,21 @@ def build_llm(settings: Settings) -> LLMRouter | None:
 
 
 def build_stt(db: Database, settings: Settings, fetch_file: FetchFile) -> SpeechService | None:
+    transcribers: list[Transcriber] = []
+    if settings.gigaam_socket:
+        transcribers.append(GigaAMTranscriber(settings.gigaam_socket, settings.gigaam_timeout_sec))
     key = settings.groq_api_key.get_secret_value().strip() if settings.groq_api_key else ""
-    if not key:
-        log.warning("GROQ_API_KEY не задан — голосовые принимаются без расшифровки, расшифровка ждёт в очереди")
+    if key:
+        transcribers.append(
+            GroqTranscriber(key, settings.groq_base_url, settings.groq_stt_model, settings.groq_stt_language)
+        )
+    if not transcribers:
+        log.warning("Расшифровка не настроена (нет GIGAAM_SOCKET и GROQ_API_KEY) — голосовые ждут в очереди")
         return None
-    transcriber = GroqTranscriber(key, settings.groq_base_url, settings.groq_stt_model, settings.groq_stt_language)
-    return SpeechService(db, transcriber, fetch_file)
+    names = " → ".join(model_label(t) for t in transcribers)
+    shadow = settings.stt_shadow and len(transcribers) > 1
+    log.info("Расшифровка голосовых: %s%s", names, " (+ теневое сравнение)" if shadow else "")
+    return SpeechService(db, transcribers, fetch_file, shadow=shadow)
 
 
 @dataclass
@@ -118,7 +134,7 @@ class App:
         if self.trello:
             await self.trello.client.close()
         if self.stt:
-            await self.stt.transcriber.close()
+            await self.stt.close()
         if self.llm:
             await self.llm.close()
         await self.bot.session.close()
@@ -148,7 +164,7 @@ async def build_app(settings: Settings, bot: Bot | None = None, db: Database | N
 
     alerter = Alerter(bot, settings, notifier)
     monitor = HealthMonitor(
-        bot, db, settings, outbox, notifier, alerter, llm=llm, stt=stt.transcriber if stt else None
+        bot, db, settings, outbox, notifier, alerter, llm=llm, stt=stt.transcribers if stt else None
     )
     bot.session.middleware(monitor.session_middleware)
     dp = build_dispatcher(db, settings, notifier, stt, assistant, monitor)

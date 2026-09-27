@@ -15,11 +15,11 @@ GROUP = -5000
 FULL = dict(
     bot_token="123:TEST", manager_chat_id=GROUP, work_start=time(0), work_end=time(23, 59, 59),
     trello_api_key="trello-key", trello_token="trello-token", trello_board_id="board",
-    groq_api_key="gsk_test_key", llm_primary_base_url="https://router.example/v1",
+    groq_api_key="gsk_test_key", gigaam_socket="/run/ceiling-bot-stt.sock", llm_primary_base_url="https://router.example/v1",
     llm_primary_api_key="sk-test-key", llm_primary_model="deepseek-v4.1-flash",
 )
 ALL_KINDS = {v for k, v in vars(dbmod).items() if k.isupper() and isinstance(v, str) and "." in v
-             and v.split(".")[0] in ("trello", "tg", "stt")}
+             and v.split(".")[0] in ("trello", "tg", "stt", "shadow")}
 
 
 async def make(db, **settings):
@@ -32,13 +32,14 @@ async def test_full_configuration_is_wired(db):
     app, session = await make(db, **FULL)
 
     assert app.trello and app.stt and app.llm
+    assert [t.label for t in app.stt.transcribers] == ["GigaAM", "Groq"] and app.stt.shadow
     labels = [p.label for p in app.llm.providers]
     assert labels == ["deepseek (router.cheap)", "groq: openai/gpt-oss-120b"]
     assert app.llm.providers[0].extra == {} and app.llm.providers[1].extra == {"reasoning_effort": "low"}
     assert app.llm.on_status_change is not None  # алерты сторожа о моделях подключены
 
     # У каждого вида задач очереди есть обработчик — иначе задачи молча копились бы вечно.
-    assert set(app.outbox.handlers) == ALL_KINDS and len(ALL_KINDS) == 11
+    assert set(app.outbox.handlers) == ALL_KINDS and len(ALL_KINDS) == 12
 
     # Сторож видит опрос Telegram через middleware сессии.
     assert app.monitor.polling_attempt is None
@@ -56,7 +57,8 @@ async def test_minimal_configuration(db, caplog):
     app, session = await make(db, bot_token="123:TEST")
     assert (app.trello, app.stt, app.llm) == (None, None, None)
     assert app.outbox.handlers == {}  # задачи копятся до появления настроек
-    for part in ("Trello не настроен", "GROQ_API_KEY не задан", "Ни одна LLM не настроена", "MANAGER_CHAT_ID не задан"):
+    for part in ("Trello не настроен", "Расшифровка не настроена", "Ни одна LLM не настроена",
+                 "MANAGER_CHAT_ID не задан"):
         assert part in caplog.text
     # Анкета по скрипту работает и без интеграций.
     client = Client(app.dp, app.bot, session)

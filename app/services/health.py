@@ -9,7 +9,7 @@ Watchdog (WATCHDOG=1) шлётся, только если живо ядро бо
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from html import escape
@@ -27,7 +27,7 @@ from app.services import systemd
 from app.services.llm import FormatError, Health, LLMRouter
 from app.services.notifier import Notifier
 from app.services.outbox import Outbox
-from app.services.stt import GroqTranscriber
+from app.services.stt import Transcriber, compare_summary, model_label
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +38,7 @@ STARTUP_GRACE = 120        # с: первые минуты после старт
 MODEL_CHECK_INTERVAL = 300  # с
 STT_FAIL_THRESHOLD = 2
 QUEUE_STUCK_AFTER = timedelta(minutes=30)
+STT_COMPARE_WINDOW = timedelta(days=14)  # за сколько дней /status сравнивает основную и теневую расшифровку
 KV_RUNNING = "running"     # 1 — процесс работает; остался 1 при старте — прошлый запуск умер аварийно
 
 REVISION_FILE = Path(__file__).resolve().parents[2] / "REVISION"
@@ -106,17 +107,19 @@ class Alerter:
 class HealthMonitor:
     def __init__(
         self, bot: Bot, db: Database, settings: Settings, outbox: Outbox, notifier: Notifier, alerter: Alerter, *,
-        llm: LLMRouter | None = None, stt: GroqTranscriber | None = None,
+        llm: LLMRouter | None = None, stt: Transcriber | Sequence[Transcriber] | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ):
         self.bot, self.db, self.settings = bot, db, settings
         self.outbox, self.notifier, self.alerter = outbox, notifier, alerter
-        self.llm, self.stt = llm, stt
+        self.llm = llm
+        # Модели расшифровки по порядку: основная, резервная. У каждой — своё здоровье и свои алерты.
+        self.stt: list[Transcriber] = list(stt) if isinstance(stt, (list, tuple)) else ([stt] if stt else [])
         self.clock = clock
         self.started_at = clock()
         self.polling_attempt: datetime | None = None  # последняя завершённая попытка getUpdates
         self.polling_ok: datetime | None = None       # последняя успешная
-        self.stt_health = Health()
+        self.stt_health = {model_label(t): Health() for t in self.stt}
         self.queue_stuck = False
         self.queue_unhandled = False  # есть задачи, которые некому выполнить (канал не настроен)
         if llm is not None:
@@ -226,23 +229,29 @@ class HealthMonitor:
                     # Успешный /models не обнуляет ошибки живых запросов: API может отвечать, а генерация — нет.
                     if h.is_down:
                         self.llm.record_ok(p.label)
-        if self.stt:
-            h = self.stt_health
-            try:
-                await asyncio.wait_for(self.stt.ping(), 20)
-            except Exception as e:  # noqa: BLE001
-                h.failures += 1
-                h.last_error = str(e) or type(e).__name__
-                if h.failures >= STT_FAIL_THRESHOLD and not h.is_down:
-                    h.down_until = self.clock()
-                    await self.alerter.send(
-                        "⚠️ Расшифровка голосовых (Groq) недоступна — голосовые принимаются, расшифровка ждёт в очереди."
-                        f"\n<code>{escape(h.last_error)[:300]}</code>"
-                    )
-            else:
-                if h.is_down:
-                    await self.alerter.send("✅ Расшифровка голосовых (Groq) снова работает")
-                h.failures, h.down_until, h.last_ok = 0, None, self.clock()
+        for t in self.stt:
+            await self._check_stt(t)
+
+    async def _check_stt(self, t: Transcriber) -> None:
+        label = model_label(t)
+        h = self.stt_health[label]
+        try:
+            await asyncio.wait_for(t.ping(), 20)
+        except Exception as e:  # noqa: BLE001
+            h.failures += 1
+            h.last_error = str(e) or type(e).__name__
+            if h.failures >= STT_FAIL_THRESHOLD and not h.is_down:
+                h.down_until = self.clock()
+                others_ok = any(not x.is_down for name, x in self.stt_health.items() if name != label)
+                tail = "работает запасная модель" if others_ok else "голосовые принимаются, расшифровка ждёт в очереди"
+                await self.alerter.send(
+                    f"⚠️ Расшифровка голосовых ({escape(label)}) недоступна — {tail}."
+                    f"\n<code>{escape(h.last_error)[:300]}</code>"
+                )
+        else:
+            if h.is_down:
+                await self.alerter.send(f"✅ Расшифровка голосовых ({escape(label)}) снова работает")
+            h.failures, h.down_until, h.last_ok = 0, None, self.clock()
 
     async def check_queue(self) -> None:
         stats = await self.db.outbox_stats(self.outbox.handlers.keys())
@@ -331,8 +340,13 @@ class HealthMonitor:
         else:
             lines.append("LLM: не настроена — анкета по скрипту")
         if self.stt:
-            h = self.stt_health
-            lines.append("Расшифровка голосовых: " + ("⛔ недоступна" if h.is_down else "✅"))
+            states = [f"{escape(model_label(t))} {'⛔ недоступна' if self.stt_health[model_label(t)].is_down else '✅'}"
+                      for t in self.stt]
+            lines.append("Расшифровка голосовых: " + ", ".join(states))
+            count, avg = compare_summary(await self.db.stt_pairs(now - STT_COMPARE_WINDOW))
+            if count:
+                lines.append(f"Сравнение расшифровок за {STT_COMPARE_WINDOW.days} дн.: {count} голосовых, "
+                             f"совпадение ~{avg:.0%}")
         else:
             lines.append("Расшифровка голосовых: не настроена")
         today = await self.db.leads_today(self.settings.zone)

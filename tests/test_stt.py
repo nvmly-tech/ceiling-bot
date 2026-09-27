@@ -16,10 +16,12 @@ from app.services.outbox import Outbox
 from app.services.stt import (
     GIVE_UP_ATTEMPTS,
     UNINTELLIGIBLE,
+    GigaAMTranscriber,
     GroqTranscriber,
     SpeechService,
     SttError,
     clean_transcript,
+    similarity,
 )
 from app.services.tgfiles import download
 from tests.conftest import USER, Client, FakeSession
@@ -29,7 +31,8 @@ from tests.test_trello import FakeTrello, make_sync
 class FakeTranscriber:
     """Groq в памяти: отдаёт тексты по очереди; Exception в очереди — ошибка; up=False — Groq лежит."""
 
-    def __init__(self, *answers: str | Exception, delay: float = 0):
+    def __init__(self, *answers: str | Exception, delay: float = 0, label: str = "Groq"):
+        self.label = label
         self.answers = list(answers)
         self.delay = delay
         self.up = True
@@ -48,9 +51,14 @@ class FakeTranscriber:
     async def close(self) -> None:
         pass
 
+    async def ping(self) -> None:
+        if not self.up:
+            raise SttError(f"{self.label}: недоступен")
+
 
 class Env:
-    def __init__(self, db: Database, transcriber: FakeTranscriber | None):
+    def __init__(self, db: Database, transcriber: FakeTranscriber | list[FakeTranscriber] | None, *,
+                 shadow: bool = False):
         settings = Settings(bot_token="123:TEST", work_start=time(0), work_end=time(23, 59, 59))
         self.db = db
         self.session = FakeSession()
@@ -60,7 +68,7 @@ class Env:
             return await download(bot, file_id)
 
         self.transcriber = transcriber
-        self.stt = SpeechService(db, transcriber, fetch) if transcriber else None
+        self.stt = SpeechService(db, transcriber, fetch, shadow=shadow) if transcriber else None
         self.trello = FakeTrello()
         sync = make_sync(db, self.trello)
         sync.fetch_file = fetch
@@ -138,7 +146,8 @@ async def test_slow_groq_falls_back_to_queue(db, monkeypatch):
     assert lead.area_text == "около 30" and lead.area_m2 == 30.0
     comments = env.trello.cards["C1"]["comments"]
     assert "🎤 Голосовое (расшифровка будет ниже)" in "\n".join(comments)
-    assert comments[-1].startswith("🎤 Расшифровка голосового от ") and comments[-1].endswith(":\n\n> около 30")
+    assert comments[-1].startswith("🎤 Расшифровка голосового от ")
+    assert comments[-1].endswith(":\n\n> около 30\n\n_— расшифровка: Groq_")  # подпись модели — только в Trello
 
 
 async def test_queue_retries_until_groq_is_back(db):
@@ -295,3 +304,168 @@ def test_clean_transcript(raw, expected):
 
 def test_payload_is_json_serializable():
     json.dumps({"message_id": 1, "field": "area", "placeholder": texts.VOICE_PLACEHOLDER}, ensure_ascii=False)
+
+
+# --- GigaAM — основная, Groq — резерв и теневое сравнение ---
+
+
+def two_models(giga: tuple = ("текст GigaAM",), groq: tuple = ("текст Groq",)):
+    return FakeTranscriber(*giga, label="GigaAM"), FakeTranscriber(*groq, label="Groq")
+
+
+async def voice_message(db):
+    lead = await db.last_lead(USER.id)
+    return [m for m in await db.get_messages(lead.id) if m.kind == "voice"][0]
+
+
+async def test_gigaam_is_primary_and_groq_shadows(db):
+    giga, groq = two_models()
+    env = Env(db, [giga, groq], shadow=True)
+    await env.client.voice("voice-1")
+
+    msg = await voice_message(db)
+    assert (msg.text, msg.model) == ("текст GigaAM", "GigaAM")
+    assert groq.calls == []  # в диалоге Groq не нужен — ответила основная
+
+    await env.run()
+    msg = await voice_message(db)
+    assert (msg.text_alt, msg.text_alt_model) == ("текст Groq", "Groq")  # тень — только в базе
+    assert msg.text == "текст GigaAM"
+    comments = "\n".join(env.trello.cards["C1"]["comments"])
+    assert "_— расшифровка: GigaAM_" in comments and "текст Groq" not in comments
+
+
+async def test_groq_takes_over_when_gigaam_fails(db):
+    giga, groq = two_models()
+    giga.up = False
+    env = Env(db, [giga, groq], shadow=True)
+    await env.client.voice("voice-1")
+    msg = await voice_message(db)
+    assert (msg.text, msg.model) == ("текст Groq", "Groq")
+
+    # Тень теперь — GigaAM; она лежит: несколько попыток и отказ, без ошибок и без влияния на заявку.
+    now = datetime.now(UTC)
+    for i in range(4):
+        await env.run(now + timedelta(hours=i))
+    msg = await voice_message(db)
+    assert msg.text_alt is None and msg.text == "текст Groq"
+    assert not [t for t in await db.outbox_pending() if t.kind == "shadow.stt"]
+
+
+async def test_slow_gigaam_leaves_time_for_groq(db, monkeypatch):
+    monkeypatch.setattr(handlers, "STT_TIMEOUT", 0.3)
+    giga, groq = two_models()
+    giga.delay = 1.0  # дольше своей доли (0.7 × 0.3 с) — клиент не ждёт, отвечает Groq
+    env = Env(db, [giga, groq])
+    await env.client.voice("voice-1")
+    msg = await voice_message(db)
+    assert (msg.text, msg.model) == ("текст Groq", "Groq")
+
+
+async def test_no_shadow_when_disabled(db):
+    giga, groq = two_models()
+    env = Env(db, [giga, groq], shadow=False)
+    await env.client.voice("voice-1")
+    await env.run()
+    assert groq.calls == [] and (await voice_message(db)).text_alt is None
+
+
+async def test_deferred_transcription_records_model_and_shadows(db):
+    giga, groq = two_models()
+    giga.up = groq.up = False
+    env = Env(db, [giga, groq], shadow=True)
+    await env.client.voice("voice-1")
+    assert (await voice_message(db)).text is None  # обе лежат — ждёт в очереди
+
+    giga.up = groq.up = True
+    now = datetime.now(UTC)
+    await env.run(now + timedelta(minutes=5))
+    await env.run(now + timedelta(minutes=10))
+    msg = await voice_message(db)
+    assert (msg.text, msg.model, msg.text_alt) == ("текст GigaAM", "GigaAM", "текст Groq")
+
+
+def test_similarity():
+    assert similarity("Площадь 18,5 м. Хочу глянцевый.", "площадь 18 5 м хочу глянцевый") == 1.0
+    assert similarity("зелёный дуб", "зеленый дуб") == 1.0
+    assert 0 < similarity("хочу матовый потолок", "хочу глянцевый потолок") < 1
+
+
+# --- клиент GigaAM (unix-сокет сервиса ceiling-bot-stt) ---
+
+
+async def fake_gigaam(path, reply: bytes, seen: list):
+    async def handle(reader, writer):
+        seen.append(await reader.read())
+        writer.write(reply)
+        await writer.drain()
+        writer.close()
+
+    return await asyncio.start_unix_server(handle, path=str(path))
+
+
+async def test_gigaam_transcriber_protocol(tmp_path):
+    sock, seen = tmp_path / "stt.sock", []
+    # Служебная строка перед ответом не мешает: берётся последняя строка JSON.
+    server = await fake_gigaam(sock, b'filtered by duration\n{"text": "\\u043f\\u0440\\u0438\\u0432\\u0435\\u0442"}\n',
+                               seen)
+    async with server:
+        t = GigaAMTranscriber(str(sock), timeout=5)
+        assert await t.transcribe(b"OGG") == "привет"
+        assert seen == [b"TRANSCRIBE\nOGG"]
+        await t.ping()
+        assert seen[-1] == b"PING\n"
+
+
+async def test_gigaam_transcriber_errors(tmp_path):
+    t = GigaAMTranscriber(str(tmp_path / "missing.sock"), timeout=5)
+    with pytest.raises(SttError, match="сервис недоступен"):
+        await t.transcribe(b"OGG")
+
+    for reply, error in ((b'{"error": "RuntimeError"}\n', "RuntimeError"), (b"", "пустой ответ"),
+                         (b"not json\n", "не JSON")):
+        sock = tmp_path / f"s{len(reply)}.sock"
+        async with await fake_gigaam(sock, reply, []):
+            with pytest.raises(SttError, match=error):
+                await GigaAMTranscriber(str(sock), timeout=5).transcribe(b"OGG")
+
+
+async def test_gigaam_timeout_and_busy_ping(tmp_path):
+    sock = tmp_path / "slow.sock"
+
+    async def handle(reader, writer):
+        await reader.read()
+        await asyncio.sleep(1)
+        writer.close()
+
+    async with await asyncio.start_unix_server(handle, path=str(sock)):
+        t = GigaAMTranscriber(str(sock), timeout=0.1)
+        with pytest.raises(SttError, match="не ответил"):
+            await t.transcribe(b"OGG")
+        async with t._busy:  # идёт расшифровка — проверка сторожа не запускает второй процесс
+            await t.ping()
+
+
+async def test_stt_compare_report(db, tmp_path):
+    from app.ops.stt_compare import report
+
+    path = tmp_path / "bot.sqlite3"
+    file_db = Database(str(path))
+    await file_db.connect()
+    lead = await file_db.create_lead(tg_user_id=1, chat_id=1, name="А", username=None, is_night=False)
+    for text, alt in (("хочу глянцевый", "Хочу глянцевый."), ("звоните 8 912 345 67 89", "звоните 8-912-345-67-89")):
+        msg_id = await file_db.add_message(lead.id, direction="in", kind="voice", text=text, file_id="v",
+                                           model="GigaAM")
+        await file_db.set_message_alt(msg_id, alt, "Groq")
+    await file_db.close()
+
+    out = report(str(path))
+    assert out.startswith("Голосовых: 2, среднее совпадение:")
+    assert "GigaAM: хочу глянцевый" in out and "Groq: Хочу глянцевый." in out
+    assert "912" not in out  # номера в отчёте скрыты
+
+    empty = tmp_path / "empty.sqlite3"
+    empty_db = Database(str(empty))
+    await empty_db.connect()
+    await empty_db.close()
+    assert "сравнивать нечего" in report(str(empty))

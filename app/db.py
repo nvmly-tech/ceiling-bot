@@ -89,6 +89,8 @@ MIGRATIONS = [
     ("leads", "summary_model", "TEXT"),            # какая модель написала резюме
     ("leads", "summary_status", "TEXT"),           # для какого статуса лида написано резюме
     ("leads", "llm_calls", "INTEGER NOT NULL DEFAULT 0"),  # обращений к LLM по заявке (бюджет токенов)
+    ("messages", "text_alt", "TEXT"),              # теневая расшифровка голосового другой моделью (для сравнения)
+    ("messages", "text_alt_model", "TEXT"),
 ]
 
 # Поля анкеты: их изменение обновляет карточку в Trello.
@@ -109,12 +111,13 @@ CARD_TAKE = "trello.card_take"
 CARD_ATTACH = "trello.attach"          # приложить файл сообщения (голосовое, фото, документ)
 CARD_TRANSCRIPT = "trello.transcript"  # комментарий с отложенной расшифровкой голосового
 STT_TRANSCRIBE = "stt.transcribe"      # отложенная расшифровка голосового
+STT_SHADOW = "shadow.stt"              # теневая расшифровка другой моделью — только для сравнения, клиенту не видна
 TG_LEAD = "tg.lead"                # уведомление о новом / брошенном лиде
 TG_REMIND = "tg.remind"            # напоминание: лид никто не взял
 TG_CLIENT_MSG = "tg.client_msg"    # клиент дописал после анкеты
 TG_DIGEST = "tg.digest"            # утренний дайджест ночных лидов
 ALL_KINDS = (CARD_CREATE, CARD_UPDATE, CARD_COMMENT, CARD_TAKE, CARD_ATTACH, CARD_TRANSCRIPT, STT_TRANSCRIBE,
-             TG_LEAD, TG_REMIND, TG_CLIENT_MSG, TG_DIGEST)
+             STT_SHADOW, TG_LEAD, TG_REMIND, TG_CLIENT_MSG, TG_DIGEST)
 
 Event = tuple[str, dict[str, Any]]
 
@@ -167,8 +170,10 @@ class Message:
     kind: str
     text: str | None
     file_id: str | None
-    model: str | None
+    model: str | None  # ответ бота — кто его сформировал; голосовое клиента — какая модель расшифровала
     created_at: str
+    text_alt: str | None = None
+    text_alt_model: str | None = None
 
 
 @dataclass
@@ -356,9 +361,26 @@ class Database:
         await self._commit()
         return cur.lastrowid
 
-    async def set_message_text(self, message_id: int, text: str) -> None:
-        await self.conn.execute("UPDATE messages SET text = ? WHERE id = ?", (text, message_id))
+    async def set_message_text(self, message_id: int, text: str, model: str | None = None) -> None:
+        await self.conn.execute(
+            "UPDATE messages SET text = ?, model = COALESCE(?, model) WHERE id = ?", (text, model, message_id)
+        )
         await self.conn.commit()
+
+    async def set_message_alt(self, message_id: int, text: str, model: str) -> None:
+        await self.conn.execute(
+            "UPDATE messages SET text_alt = ?, text_alt_model = ? WHERE id = ?", (text, model, message_id)
+        )
+        await self.conn.commit()
+
+    async def stt_pairs(self, since: datetime) -> list[Message]:
+        """Голосовые, расшифрованные обеими моделями (основной и теневой), — для сравнения."""
+        async with self.conn.execute(
+            "SELECT * FROM messages WHERE kind = 'voice' AND text IS NOT NULL AND text_alt IS NOT NULL"
+            " AND created_at >= ? ORDER BY id",
+            (now_iso(since),),
+        ) as cur:
+            return [Message(**dict(r)) for r in await cur.fetchall()]
 
     async def get_message(self, message_id: int) -> Message | None:
         async with self.conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)) as cur:
