@@ -127,3 +127,14 @@ async def test_night_greeting(db):
     greeting = session.sent()[-2].text
     assert "нерабочее время" in greeting and "завтра в 0:00" in greeting
     assert (await db.last_lead(USER.id)).is_night
+
+
+def test_greeting_promises_as_many_questions_as_asked():
+    # Приветствие обещает N вопросов — столько их и должно быть, с нумерацией 1/N … N/N.
+    from app.bot.assistant import FIELD_ORDER
+
+    n = len(FIELD_ORDER)
+    questions = [texts.Q_OBJECT, texts.Q_AREA, texts.Q_CEILING_TYPE, texts.Q_PHONE, texts.Q_MEASURE_TIME]
+    assert len(questions) == n
+    assert all(q.startswith(f"{i}/{n}. ") for i, q in enumerate(questions, 1))
+    assert f"{n} коротких вопросов" in texts.GREETING_DAY and f"{n} коротких вопросов" in texts.GREETING_NIGHT

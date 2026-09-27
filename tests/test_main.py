@@ -7,6 +7,7 @@ from datetime import time
 from aiogram import Bot
 
 from app import db as dbmod
+from app.bot import texts
 from app.config import Settings
 from app.main import build_app, build_llm
 from tests.conftest import Client, FakeSession
@@ -61,7 +62,7 @@ async def test_minimal_configuration(db, caplog):
     # Анкета по скрипту работает и без интеграций.
     client = Client(app.dp, app.bot, session)
     await client.text("/start")
-    assert "1/4" in client.last_text()
+    assert client.last_text() == texts.Q_OBJECT
     await app.close()
 
 
