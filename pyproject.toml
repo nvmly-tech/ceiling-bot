@@ -31,6 +31,8 @@ select = ["E", "F", "I"]
 [tool.coverage.run]
 source = ["app", "deploy"]
 branch = true
+# Сервис GigaAM работает в своём окружении (gigaam, torch) — его проверяет install.sh на сервере.
+omit = ["deploy/stt/*"]
 
 [tool.coverage.report]
 # Покрытие не должно проседать незаметно: deploy.sh не выложит версию ниже порога.

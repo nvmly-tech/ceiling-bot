@@ -1,0 +1,15 @@
+[Unit]
+Description=GigaAM speech-to-text for ceiling-bot (socket)
+
+[Socket]
+ListenStream=/run/ceiling-bot-stt.sock
+# Каждое подключение — отдельный процесс ceiling-bot-stt@.service: модель в памяти только на время запроса.
+Accept=yes
+# Бот — DynamicUser без постоянного uid, поэтому права на сокет открыты; процессы-обработчики без сети.
+SocketMode=0666
+# Одна расшифровка (бот сам не шлёт больше) + проверка сторожа. Лишние подключения отклоняются —
+# бот тогда переключается на Groq.
+MaxConnections=2
+
+[Install]
+WantedBy=sockets.target

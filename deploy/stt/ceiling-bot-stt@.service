@@ -1,0 +1,43 @@
+[Unit]
+Description=GigaAM transcription request for ceiling-bot
+CollectMode=inactive-or-failed
+
+[Service]
+ExecStart=/opt/ceiling-bot-stt/venv/bin/python /opt/ceiling-bot-stt/worker.py
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+Environment=OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 HOME=/tmp
+# 71 с аудио — ~8 с и ~820 МБ на сервере; лимиты с запасом, но чтобы не задеть бота.
+MemoryMax=1200M
+CPUWeight=50
+RuntimeMaxSec=300
+
+DynamicUser=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+MemoryDenyWriteExecute=yes
+UMask=0077
