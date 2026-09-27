@@ -24,9 +24,15 @@ SAMPLE_RATE = 16000
 CHUNK_MAX_S, CHUNK_MIN_S, WINDOW_S = 22.0, 12.0, 0.25
 
 
+# stdout — это подключение к боту, а gigaam и onnxruntime печатают туда служебные строки («filtered by
+# duration…»). Ответ пишем в копию дескриптора, а сам stdout (и на уровне Python, и fd 1) уводим в журнал.
+_REPLY_FD = os.dup(1)
+os.dup2(2, 1)
+sys.stdout = sys.stderr
+
+
 def reply(obj: dict) -> None:
-    sys.stdout.buffer.write(json.dumps(obj, ensure_ascii=False).encode() + b"\n")
-    sys.stdout.buffer.flush()
+    os.write(_REPLY_FD, json.dumps(obj, ensure_ascii=False).encode() + b"\n")
 
 
 def split(wav, np):
