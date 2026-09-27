@@ -8,8 +8,9 @@ StandardInput=socket
 StandardOutput=socket
 StandardError=journal
 Environment=OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 HOME=/tmp
-# 71 с аудио — ~8 с и ~820 МБ на сервере; лимиты с запасом, но чтобы не задеть бота.
-MemoryMax=1200M
+# 71 с аудио — ~8 с и ~820 МБ на сервере. В лимит входит и кэш файлов модели (~300 МБ): на живом голосовом
+# пик доходил до 1.1 ГБ, поэтому 1.4 ГБ — с запасом, но так, чтобы боту (~0.2 ГБ) хватало памяти на 2 ГБ.
+MemoryMax=1400M
 CPUWeight=50
 RuntimeMaxSec=300
 
