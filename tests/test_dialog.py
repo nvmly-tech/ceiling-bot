@@ -1,5 +1,6 @@
 from datetime import time
 
+import pytest
 from aiogram import Bot
 
 from app.bot import texts
@@ -129,12 +130,43 @@ async def test_night_greeting(db):
     assert (await db.last_lead(USER.id)).is_night
 
 
-def test_greeting_promises_as_many_questions_as_asked():
-    # Приветствие обещает N вопросов — столько их и должно быть, с нумерацией 1/N … N/N.
-    from app.bot.assistant import FIELD_ORDER
+def test_greeting_promises_four_questions_as_in_spec():
+    # ТЗ: квалификация на 3–4 вопроса. Нумерованных вопросов 4, телефон и время замера — в одном,
+    # уточнение времени (если прислали только номер) — без номера, это не отдельный вопрос анкеты.
+    questions = [texts.Q_OBJECT, texts.Q_AREA, texts.Q_CEILING_TYPE, texts.Q_PHONE]
+    assert all(q.startswith(f"{i}/4. ") for i, q in enumerate(questions, 1))
+    assert "замер" in texts.Q_PHONE and not texts.Q_MEASURE_TIME[0].isdigit()
+    assert "4 коротких вопроса" in texts.GREETING_DAY and "4 коротких вопроса" in texts.GREETING_NIGHT
 
-    n = len(FIELD_ORDER)
-    questions = [texts.Q_OBJECT, texts.Q_AREA, texts.Q_CEILING_TYPE, texts.Q_PHONE, texts.Q_MEASURE_TIME]
-    assert len(questions) == n
-    assert all(q.startswith(f"{i}/{n}. ") for i, q in enumerate(questions, 1))
-    assert f"{n} коротких вопросов" in texts.GREETING_DAY and f"{n} коротких вопросов" in texts.GREETING_NIGHT
+
+async def test_phone_and_time_in_one_answer(client: Client, db):
+    await client.text("/start")
+    for button in ("obj:flat", "area:15_30", "ct:matte"):
+        await client.press(button)
+    await client.text("мой номер 8 912 345-67-89, удобно в субботу после обеда")
+    assert "Заявка №1 принята" in client.last_text()  # время уже есть — не переспрашиваем
+    lead = await db.last_lead(USER.id)
+    assert lead.phone == "+79123456789" and lead.measure_time == "удобно в субботу после обеда"
+
+
+async def test_phone_without_time_asks_time(client: Client, db):
+    await client.text("/start")
+    for button in ("obj:flat", "area:15_30", "ct:matte"):
+        await client.press(button)
+    await client.text("мой номер 8 912 345-67-89")  # «мой номер» — не время замера
+    assert client.last_text() == texts.Q_MEASURE_TIME
+    assert (await db.last_lead(USER.id)).measure_time is None
+
+
+@pytest.mark.parametrize(("rest", "expected"), [
+    (" , завтра в 18:00", "завтра в 18:00"),
+    ("мой номер  , удобно в выходные", "удобно в выходные"),
+    ("звоните после 18", "после 18"),
+    ("телефон ", None),
+    ("мой номер", None),
+    (" спасибо", None),
+])
+def test_measure_time_from_rest(rest, expected):
+    from app.bot.handlers import measure_time_from
+
+    assert measure_time_from(rest) == expected

@@ -1,4 +1,4 @@
-"""Диалог квалификации: 5 вопросов → заявка.
+"""Диалог квалификации: 4 вопроса → заявка (4-й — телефон и время замера вместе).
 
 Каждое входящее и исходящее сообщение пишется в таблицу messages — из неё потом
 собирается полная переписка для карточки Trello. Голосовые расшифровываются сразу
@@ -11,6 +11,7 @@ SkipHandler, и сообщение обрабатывает скрипт (обр
 
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -34,7 +35,7 @@ from app.bot.assistant import LeadAssistant, missing_fields
 from app.bot.states import QUESTIONS, Lead
 from app.config import Settings
 from app.db import STT_SHADOW, STT_TRANSCRIBE, TG_CLIENT_MSG, Database, now_iso
-from app.parsing import clip, normalize_phone, parse_area
+from app.parsing import clip, normalize_phone, parse_area, replace_phones
 from app.services.llm import LLMError
 from app.services.stt import SpeechService
 from app.worktime import is_work_time, local_now, manager_eta
@@ -419,6 +420,23 @@ async def on_ceiling_text(
     await advance(message, state, db, settings, lead_id)
 
 
+# Признаки времени замера в ответе рядом с номером; без них остаток («мой номер») временем не считаем.
+_TIME_CUES = re.compile(
+    r"понедельн|вторник|сред[ауы]|четверг|пятниц|суббот|воскресен|выходн|будн|сегодня|завтра|утр|вечер|"
+    r"дн[её]м|обед|ноч|час|любое|недел|числ|\bпосле\b|\bс\s*\d|\bдо\s*\d|\d{1,2}[:.]\d{2}",
+    re.IGNORECASE,
+)
+_FILLER = re.compile(r"\b(мой|моя|номер|телефон|тел|звоните|позвоните|пишите|вот)\b\.?", re.IGNORECASE)
+
+
+def measure_time_from(rest: str) -> str | None:
+    """Время замера из остатка ответа после номера телефона, если оно там есть."""
+    if not _TIME_CUES.search(rest):
+        return None
+    when = re.sub(r"\s+", " ", _FILLER.sub(" ", rest)).strip(" ,.;:—–-")
+    return clip(when) if when else None
+
+
 async def on_phone(message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming) -> None:
     lead_id = (await state.get_data())["lead_id"]
     await log_in(db, lead_id, item, "phone")
@@ -429,9 +447,16 @@ async def on_phone(message: Message, state: FSMContext, db: Database, settings: 
     elif item.pending:
         phone = item.answer  # номер подставится из расшифровки, когда она будет готова
     else:
-        phone = normalize_phone(item.text)
+        # 4-й вопрос просит номер и время замера сразу: «8 912 345-67-89, в субботу после обеда».
+        found: list[str] = []
+        rest = replace_phones(item.text or "", lambda p: found.append(p) or " ")
+        phone = found[0] if found else normalize_phone(item.text or "")
         if phone is None:
             await say(message, db, lead_id, texts.Q_PHONE_RETRY, keyboards.phone())
+            return
+        if when := measure_time_from(rest):
+            await db.update_lead(lead_id, phone=phone, measure_time=when)
+            await advance(message, state, db, settings, lead_id)
             return
     await db.update_lead(lead_id, phone=phone)
     await advance(message, state, db, settings, lead_id)
