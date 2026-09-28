@@ -32,6 +32,15 @@ if grep -q '^DB_PATH=' "$ENV_FILE"; then
     echo "!! в $ENV_FILE есть DB_PATH — он перекроет путь к базе из unit-файла; удалите строку, если это не намеренно"
 fi
 
+# Факты о студии: рабочая копия вне кода — выкладка её не перезаписывает, студия правит сама.
+FACTS=/etc/ceiling-bot/facts.md
+mkdir -p "$(dirname "$FACTS")"
+chmod 755 "$(dirname "$FACTS")"
+if [ ! -f "$FACTS" ]; then
+    install -m 644 facts.md "$FACTS"
+    echo "!! создан $FACTS из образца (синтетические цены) — замените на цифры студии, перезапуск не нужен"
+fi
+
 for unit in $UNIT ceiling-bot-alert.service ceiling-bot-backup.service ceiling-bot-backup-alert.service \
             ceiling-bot-backup.timer; do
     install -m 644 "deploy/$unit" "/etc/systemd/system/$unit"

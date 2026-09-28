@@ -94,3 +94,11 @@ def test_bad_env_values_fail_at_startup():
         with pytest.raises(ValidationError):
             Settings(**kw)
     assert Settings(bot_token="1:x", studio_tz="Asia/Yekaterinburg").zone.key == "Asia/Yekaterinburg"
+
+
+async def test_facts_file_from_settings(db, tmp_path):
+    facts = tmp_path / "facts.md"
+    facts.write_text("- Матовый — от 610 ₽/м².", encoding="utf-8")
+    app, _ = await make(db, **FULL, facts_path=str(facts))
+    assert app.dp["assistant"].facts.path == facts and app.dp["assistant"].facts.allowed_amounts == {610}
+    await app.close()

@@ -5,11 +5,13 @@
 """
 
 import json
-import re
+from collections.abc import Collection
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from app.bot import prompts, texts
+from app.bot.facts import StudioFacts, default_facts, rubles
 from app.db import Lead, Message
 from app.parsing import AREA_MAX, AREA_MIN, clip, normalize_phone, parse_area, replace_phones
 from app.services.llm import LLMRouter
@@ -100,29 +102,18 @@ class Turn:
     model: str = ""
 
 
-# Сумма в рублях в ответе модели: «500 ₽», «1 700 ₽», «≈ 34 000 руб.» (пробелы внутри числа — любые).
-_RUBLES = re.compile(r"(\d[\d\s\u00a0\u202f]*)\s*(?:₽|руб)")
-
-
-def _amounts(text: str) -> set[int]:
-    return {int(re.sub(r"\D", "", m.group(1))) for m in _RUBLES.finditer(text)}
-
-
-# Модель может называть только суммы из фактов о студии. Резервная модель сама умножала цену за м² на площадь
-# («от 34 000 ₽» за зал) — такая «смета» выглядит как обещание студии, а посчитать её честно можно только на замере.
-ALLOWED_AMOUNTS = _amounts(prompts.STUDIO_FACTS)
-
-
-def check_amounts(reply: str) -> None:
-    if unknown := _amounts(reply) - ALLOWED_AMOUNTS:
+def check_amounts(reply: str, allowed: Collection[int]) -> None:
+    """Модель может называть только суммы из фактов о студии. Резервная модель сама умножала цену за м² на площадь
+    («от 34 000 ₽» за зал) — такая «смета» выглядит как обещание студии, а честно её считают только на замере."""
+    if unknown := rubles(reply) - set(allowed):
         raise ValueError(f"сумма не из фактов о студии: {sorted(unknown)}")
 
 
-def parse_turn(data: dict) -> Turn:
+def parse_turn(data: dict, allowed: Collection[int] | None = None) -> Turn:
     reply = _str(data.get("reply"), REPLY_LIMIT)
     if not reply:
         raise ValueError("пустой reply")
-    check_amounts(reply)
+    check_amounts(reply, default_facts().allowed_amounts if allowed is None else allowed)
     fields = data.get("fields") or {}
     if not isinstance(fields, dict):
         raise ValueError("fields не объект")
@@ -172,8 +163,9 @@ def transcript(history: list[Message]) -> str:
 
 
 class LeadAssistant:
-    def __init__(self, router: LLMRouter):
+    def __init__(self, router: LLMRouter, facts: StudioFacts | None = None):
         self.router = router
+        self.facts = facts or default_facts()
 
     async def dialog_turn(
         self, lead: Lead, history: list[Message], new_text: str | None, *, done: bool, eta: str
@@ -181,7 +173,7 @@ class LeadAssistant:
         """Ответ клиенту и поля анкеты из его последнего сообщения. LLMError — ни одна модель не справилась."""
         system = prompts.dialog_system(
             known_fields(lead, mask_phone=True), missing_fields(lead) or ["measure_time"],
-            done=done, lead_id=lead.id, eta=eta,
+            done=done, lead_id=lead.id, eta=eta, facts=self.facts.text,
         )
         messages = [{"role": "system", "content": system}, *history_messages(history)]
         phones: list[str] = []
@@ -189,7 +181,7 @@ class LeadAssistant:
             masked, phones = mask_phones(new_text)
             messages.append({"role": "user", "content": clip(masked, NEW_MESSAGE_MAX)})
         messages.append({"role": "system", "content": prompts.FORMAT_REMINDER})
-        turn, model = await self.router.json(messages, parse_turn)
+        turn, model = await self.router.json(messages, partial(parse_turn, allowed=self.facts.allowed_amounts))
         turn.model = model
         if phones and "phone" not in turn.updates:
             turn.updates["phone"] = phones[0]  # номер нашли сами — модель видела только «[телефон]»

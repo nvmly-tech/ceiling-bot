@@ -443,9 +443,7 @@ def test_studio_facts_give_price_guidance_not_commitments():
         assert fact in system
     # Правило: только как ориентир, точная сумма — на замере; итог заказа не считать.
     assert "ориентир" in system and "бесплатном замере" in system and "итоговую сумму" in system
-    # Скидки, рассрочка и оплата — обязательства студии, бот их не обещает.
-    assert "рассрочк" not in prompts.STUDIO_FACTS and "предоплат" not in prompts.STUDIO_FACTS
-    assert "бот не называет" not in prompts.STUDIO_FACTS
+    # Скидки, рассрочка и оплата — обязательства студии, их в образце фактов нет (см. test_facts).
 
 
 @pytest.mark.parametrize("reply", [

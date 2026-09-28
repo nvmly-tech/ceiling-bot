@@ -8,6 +8,7 @@ from aiogram import Bot, Dispatcher
 
 from app import redact
 from app.bot.assistant import LeadAssistant
+from app.bot.facts import DEFAULT_FILE, StudioFacts
 from app.bot.handlers import create_router
 from app.bot.manager import create_manager_router
 from app.bot.storage import SQLiteStorage
@@ -150,7 +151,7 @@ async def build_app(settings: Settings, bot: Bot | None = None, db: Database | N
     trello = build_trello(db, settings, fetch_file)
     stt = build_stt(db, settings, fetch_file)
     llm = build_llm(settings)
-    assistant = LeadAssistant(llm) if llm else None
+    assistant = LeadAssistant(llm, StudioFacts(settings.facts_path or DEFAULT_FILE)) if llm else None
     notifier = Notifier(bot, db, settings, trello_enabled=trello is not None, assistant=assistant)
 
     handlers = dict(trello.handlers) if trello else {}

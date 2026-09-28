@@ -23,6 +23,8 @@ ExecStopPost=/opt/ceiling-bot/.venv/bin/python -m app.ops.alert stop
 EnvironmentFile=/etc/Solaris/ceiling-bot.env
 # DB_PATH не пишите в env-файл: EnvironmentFile перекрывает Environment.
 Environment=DB_PATH=/var/lib/ceiling-bot/ceiling-bot.sqlite3
+# Факты о студии: студия правит сама, бот подхватывает без перезапуска; install.sh создаёт из образца.
+Environment=FACTS_PATH=/etc/ceiling-bot/facts.md
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=5
