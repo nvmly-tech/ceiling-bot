@@ -432,3 +432,41 @@ async def test_hanging_llm_does_not_hold_the_queue(db, monkeypatch):
     assert _time.monotonic() - t0 < 2  # без бюджета было бы ~10 с (2 модели × 5 с)
     msg = session.sent(-5000)[0].text
     assert "Новая заявка №1" in msg and "резюме" not in msg
+
+
+def test_studio_facts_give_price_guidance_not_commitments():
+    from app.bot import prompts
+
+    system = prompts.dialog_system({}, ["object"], done=False, lead_id=1, eta="завтра в 9:00")
+    # Ориентиры по рынку (синтетика до реальных цен студии): цены «от», сроки, гарантия.
+    for fact in ("от 500 ₽/м²", "от 1 700 ₽/м²", "2–5 дней", "2–4 часа", "10–15 лет"):
+        assert fact in system
+    # Правило: только как ориентир, точная сумма — на замере; итог заказа не считать.
+    assert "ориентир" in system and "бесплатном замере" in system and "итоговую сумму" in system
+    # Скидки, рассрочка и оплата — обязательства студии, бот их не обещает.
+    assert "рассрочк" not in prompts.STUDIO_FACTS and "предоплат" not in prompts.STUDIO_FACTS
+    assert "бот не называет" not in prompts.STUDIO_FACTS
+
+
+@pytest.mark.parametrize("reply", [
+    "Матовый в спальню 12 м² обойдётся ориентировочно от 6 000 ₽, точнее — на замере.",
+    "Тканевый с линиями будет стоить от ≈ 34 000 ₽.",
+    "Выйдет примерно 9250 рублей.",
+    "Скидка 3 000 руб. при заказе сегодня!",
+])
+def test_reply_with_price_not_from_facts_is_rejected(reply):
+    # Резервная модель сама перемножала цену на площадь — такую «смету» клиенту не показываем.
+    with pytest.raises(ValueError, match="сумма не из фактов"):
+        parse_turn(turn(reply))
+
+
+def test_reply_with_prices_from_facts_passes():
+    reply = "Матовый — от 500 ₽/м², тканевый — от 1 700 ₽/м², световые линии — от 3 700 ₽ за погонный метр."
+    assert parse_turn(turn(reply)).reply == reply
+
+
+async def test_made_up_price_goes_to_next_model():
+    router = LLMRouter([FakeProvider("deepseek", turn("Итого от 34 000 ₽.")),
+                        FakeProvider("groq", turn("Тканевый — от 1 700 ₽/м², точнее — на замере."))])
+    result, model = await router.json([{"role": "user", "content": "сколько?"}], parse_turn)
+    assert model == "groq" and "1 700" in result.reply

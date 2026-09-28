@@ -5,6 +5,7 @@
 """
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -99,10 +100,29 @@ class Turn:
     model: str = ""
 
 
+# Сумма в рублях в ответе модели: «500 ₽», «1 700 ₽», «≈ 34 000 руб.» (пробелы внутри числа — любые).
+_RUBLES = re.compile(r"(\d[\d\s\u00a0\u202f]*)\s*(?:₽|руб)")
+
+
+def _amounts(text: str) -> set[int]:
+    return {int(re.sub(r"\D", "", m.group(1))) for m in _RUBLES.finditer(text)}
+
+
+# Модель может называть только суммы из фактов о студии. Резервная модель сама умножала цену за м² на площадь
+# («от 34 000 ₽» за зал) — такая «смета» выглядит как обещание студии, а посчитать её честно можно только на замере.
+ALLOWED_AMOUNTS = _amounts(prompts.STUDIO_FACTS)
+
+
+def check_amounts(reply: str) -> None:
+    if unknown := _amounts(reply) - ALLOWED_AMOUNTS:
+        raise ValueError(f"сумма не из фактов о студии: {sorted(unknown)}")
+
+
 def parse_turn(data: dict) -> Turn:
     reply = _str(data.get("reply"), REPLY_LIMIT)
     if not reply:
         raise ValueError("пустой reply")
+    check_amounts(reply)
     fields = data.get("fields") or {}
     if not isinstance(fields, dict):
         raise ValueError("fields не объект")
