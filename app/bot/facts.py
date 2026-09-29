@@ -11,6 +11,7 @@
 
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -19,6 +20,40 @@ DEFAULT_FILE = Path(__file__).resolve().parents[2] / "facts.md"
 _COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)  # служебные пометки для студии — в промпт не идут
 # Сумма в рублях: «500 ₽», «1 700 ₽», «≈ 34 000 руб.» (пробелы внутри числа — любые).
 _RUBLES = re.compile(r"(\d[\d\s  ]*)\s*(?:₽|руб)")
+
+
+# Окончания прилагательных: «матовый / матовые / матового…» → основа «матов».
+_ADJ_END = re.compile(r"(ыми|ими|ого|его|ому|ему|ый|ий|ой|ая|яя|ое|ее|ые|ие|ым|им|ом|ем|ую|юю|ых|их)$")
+
+
+def stem(word: str) -> str:
+    return _ADJ_END.sub("", word.lower().replace("ё", "е"))
+
+
+def is_adjective(word: str) -> bool:
+    return len(word) >= 5 and bool(_ADJ_END.search(word.lower()))
+
+
+@dataclass(frozen=True)
+class CeilingVocab:
+    """Виды потолков для проверки ответа модели. core — сами виды («Виды:» в фактах и кнопки анкеты): по ним видно,
+    что модель перечисляет виды; known — все прилагательные из фактов: только их можно называть в перечислении."""
+
+    core: frozenset[str]
+    known: frozenset[str]
+    words: frozenset[str]  # сами названия видов целиком (для поиска опечаток: «парижский» ~ «парящий»)
+
+
+def ceiling_vocab(text: str) -> CeilingVocab:
+    from app.bot import texts
+
+    buttons = " ".join(texts.CEILING_OPTIONS.values())
+    kinds = " ".join(line.split(":", 1)[1] for line in text.splitlines() if "Виды:" in line)
+    words = lambda s: re.findall(r"[А-Яа-яЁё]+", s)  # noqa: E731
+    kind_words = {w.lower().replace("ё", "е") for w in words(kinds + " " + buttons) if is_adjective(w)}
+    core = {stem(w) for w in kind_words}
+    known = core | {stem(w) for w in words(text) if is_adjective(w)}
+    return CeilingVocab(frozenset(core), frozenset(known), frozenset(kind_words))
 
 
 def rubles(text: str) -> set[int]:
@@ -45,7 +80,7 @@ class StudioFacts:
             log.warning("Факты о студии: %s не найден — работаю на образце из репозитория", self.path)
 
     def _set(self, text: str) -> None:
-        self._text, self._amounts = text, frozenset(rubles(text))
+        self._text, self._amounts, self._vocab = text, frozenset(rubles(text)), ceiling_vocab(text)
 
     def _report(self, problem: str) -> None:
         # На старте прежней версии нет — об этом отдельное предупреждение в __init__ (переход на образец).
@@ -80,6 +115,11 @@ class StudioFacts:
     def allowed_amounts(self) -> frozenset[int]:
         self.refresh()
         return self._amounts
+
+    @property
+    def ceiling_types(self) -> CeilingVocab:
+        self.refresh()
+        return self._vocab
 
 
 _default: StudioFacts | None = None

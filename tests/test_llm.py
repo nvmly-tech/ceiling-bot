@@ -494,3 +494,56 @@ async def test_room_after_object_button_keeps_type(db):
     await client.press("obj:flat")
     await client.text("в спальню, метров 18 примерно")
     assert (await db.last_lead(USER.id)).object == "Квартира, спальня"
+
+
+# --- проверка ответа модели: номера вопросов и виды потолков ---
+
+
+def test_question_numbers_are_stripped_from_reply():
+    t = parse_turn(turn("Поняла: спальня около 18 м². 3/4. Какой потолок интересует?"))
+    assert t.reply == "Поняла: спальня около 18 м². Какой потолок интересует?"
+    assert parse_turn(turn("1/4 Где нужен потолок?")).reply == "Где нужен потолок?"
+    assert parse_turn(turn("Замер займёт 1/2 часа.")).reply == "Замер займёт 1/2 часа."  # не номер вопроса
+
+
+@pytest.mark.parametrize("reply", [
+    "Какой потолок интересует: матовый, глянцевый, тканевый или, может быть, парижский?",  # опечатка модели
+    "Матовый, глянцевый или двухуровневый?",                                              # вида нет в фактах
+    "Матавый, глянцевый или сатинновый?",                                                 # опечатки в названиях
+])
+def test_unknown_ceiling_type_in_enumeration_rejected(reply):
+    with pytest.raises(ValueError, match="вид потолка не из фактов"):
+        parse_turn(turn(reply))
+
+
+@pytest.mark.parametrize("reply", [
+    "Какой потолок интересует: матовый, глянцевый, тканевый, парящий или световые линии?",
+    "Матовый, глянцевый, сатиновый, тканевый, парящий, световые линии или теневой профиль?",
+    "Глянцевый или матовый с подсветкой?",
+    "Поняла: спальня, около 18 м². Какой потолок нужен?",
+    "Есть матовые и глянцевые полотна, а ещё цветной — от 800 ₽/м².",
+    # Цвета, оценки и сравнения в перечислении — не виды потолков, ответ не бракуем.
+    "Матовый или глянцевый, белый или цветной?",
+    "Матовый — классический, глянцевый — зрительно увеличивает комнату.",
+    "Матовый, глянцевый или сатиновый — все практичные и недорогие.",
+    "Матовый, глянцевый или тканевый — какой удобнее?",
+])
+def test_known_ceiling_types_pass(reply):
+    assert parse_turn(turn(reply)).reply == reply
+
+
+def test_ceiling_types_follow_facts_file(tmp_path):
+    from app.bot.facts import StudioFacts
+
+    path = tmp_path / "facts.md"
+    path.write_text("- Виды: матовые, глянцевые, резные.", encoding="utf-8")
+    facts = StudioFacts(path)
+    reply = "Матовый, глянцевый или резной?"
+    assert parse_turn(turn(reply), types=facts.ceiling_types).reply == reply  # студия добавила вид — можно
+
+
+async def test_bad_ceiling_type_goes_to_next_model():
+    router = LLMRouter([FakeProvider("deepseek", turn("Матовый, глянцевый или парижский?")),
+                        FakeProvider("groq", turn("Матовый, глянцевый или парящий?"))])
+    result, model = await router.json([{"role": "user", "content": "какие бывают?"}], parse_turn)
+    assert model == "groq" and "парящий" in result.reply

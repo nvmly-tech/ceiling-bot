@@ -4,6 +4,7 @@
 переходит к следующей. Поля анкеты из ответа нормализуются так же, как ответы по скрипту.
 """
 
+import difflib
 import json
 import re
 from collections.abc import Collection
@@ -12,7 +13,7 @@ from functools import partial
 from typing import Any
 
 from app.bot import prompts, texts
-from app.bot.facts import StudioFacts, default_facts, rubles
+from app.bot.facts import CeilingVocab, StudioFacts, default_facts, is_adjective, rubles, stem
 from app.db import Lead, Message
 from app.parsing import AREA_MAX, AREA_MIN, clip, normalize_phone, parse_area, replace_phones
 from app.services.llm import LLMRouter
@@ -120,6 +121,53 @@ def merge_object(current: str | None, new: str) -> str:
     return f"{kind}, {new}" if _OBJECT_TYPE.search(kind) else new
 
 
+# Номер вопроса анкеты («3/4. Какой потолок…») — это разметка бота; модель иногда копирует её в свой ответ.
+_QUESTION_NUMBER = re.compile(r"(^|\s)[1-4]\s*/\s*4\.?\s+(?=[А-ЯЁA-Z])")
+# Слова, которые в перечислении видов потолков не являются видом.
+_NOT_A_KIND = {
+    "может", "быть", "или", "и", "а", "еще", "также", "например", "есть", "либо", "потолок", "потолки", "потолка",
+    "натяжной", "натяжные", "натяжного", "какой", "какие", "какую", "другой", "другие", "другое", "любой", "иной",
+    "нужный", "подходящий", "интересует", "нужен", "вам", "вас", "же", "то", "это", "вот", "тоже", "пока",
+}
+
+
+def _known(word_stem: str, stems: frozenset[str]) -> bool:
+    """Основа совпадает или одна продолжает другую («парящ» — «парящ»; «светов» — «световы…»)."""
+    return any(
+        word_stem == s or (min(len(word_stem), len(s)) >= 4 and (word_stem.startswith(s) or s.startswith(word_stem)))
+        for s in stems
+    )
+
+
+# Виды потолков, которые бывают в отрасли: если студия их не указала в фактах — модели их не предлагать.
+_INDUSTRY_KINDS = ("двухуровнев", "многоуровнев", "трехуровнев", "звездн", "резн", "перфорирован", "зеркальн",
+                   "фактурн", "текстурн", "лакирован", "витражн", "ступенчат", "фотопечат")
+
+
+def _typo_of_kind(word: str, kind_words: frozenset[str]) -> bool:
+    """Похоже на искажённое название вида из фактов (не само название): «парижский» ~ «парящий»."""
+    return any(difflib.SequenceMatcher(None, word, k).ratio() >= 0.6 for k in kind_words)
+
+
+def check_ceiling_types(reply: str, vocab: CeilingVocab) -> None:
+    """В перечислении видов потолков вид из фактов о студии можно назвать как угодно, а незнакомое слово — брак
+    ответа (следующая модель или скрипт), если это искажённое название вида («парижский» вместо «парящий») или
+    вид, которого у студии нет («двухуровневый»). Цвета и оценки («белый», «практичный») не трогаем."""
+    for sentence in re.split(r"[.!?\n]+", reply.lower().replace("ё", "е")):
+        words = re.findall(r"[а-я]+", sentence)
+        kindish = [w for w in words
+                   if is_adjective(w) and (_known(stem(w), vocab.core) or _typo_of_kind(w, vocab.words))]
+        if len(kindish) < 2:
+            continue  # не перечисление видов (слова с опечаткой в названии вида тоже считаем)
+        for item in re.split(r"[,;:—–()]|\bили\b|\bи\b", sentence):
+            tokens = [w for w in re.findall(r"[а-я]+", item) if w not in _NOT_A_KIND]
+            if len(tokens) != 1 or not is_adjective(tokens[0]) or _known(stem(tokens[0]), vocab.known):
+                continue
+            word = tokens[0]
+            if stem(word).startswith(_INDUSTRY_KINDS) or _typo_of_kind(word, vocab.words):
+                raise ValueError(f"вид потолка не из фактов о студии: {word}")
+
+
 def check_amounts(reply: str, allowed: Collection[int]) -> None:
     """Модель может называть только суммы из фактов о студии. Резервная модель сама умножала цену за м² на площадь
     («от 34 000 ₽» за зал) — такая «смета» выглядит как обещание студии, а честно её считают только на замере."""
@@ -127,11 +175,13 @@ def check_amounts(reply: str, allowed: Collection[int]) -> None:
         raise ValueError(f"сумма не из фактов о студии: {sorted(unknown)}")
 
 
-def parse_turn(data: dict, allowed: Collection[int] | None = None) -> Turn:
+def parse_turn(data: dict, allowed: Collection[int] | None = None, types: CeilingVocab | None = None) -> Turn:
     reply = _str(data.get("reply"), REPLY_LIMIT)
     if not reply:
         raise ValueError("пустой reply")
+    reply = _QUESTION_NUMBER.sub(r"\1", reply).strip()
     check_amounts(reply, default_facts().allowed_amounts if allowed is None else allowed)
+    check_ceiling_types(reply, default_facts().ceiling_types if types is None else types)
     fields = data.get("fields") or {}
     if not isinstance(fields, dict):
         raise ValueError("fields не объект")
@@ -199,7 +249,8 @@ class LeadAssistant:
             masked, phones = mask_phones(new_text)
             messages.append({"role": "user", "content": clip(masked, NEW_MESSAGE_MAX)})
         messages.append({"role": "system", "content": prompts.FORMAT_REMINDER})
-        turn, model = await self.router.json(messages, partial(parse_turn, allowed=self.facts.allowed_amounts))
+        check = partial(parse_turn, allowed=self.facts.allowed_amounts, types=self.facts.ceiling_types)
+        turn, model = await self.router.json(messages, check)
         turn.model = model
         if phones and "phone" not in turn.updates:
             turn.updates["phone"] = phones[0]  # номер нашли сами — модель видела только «[телефон]»
