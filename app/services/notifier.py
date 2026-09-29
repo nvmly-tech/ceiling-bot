@@ -234,7 +234,7 @@ class Notifier:
         labels = {"voice": "🎤", "photo": "📷 фото", "document": "📎 файл", "video_note": "📹 видео", "contact": "📱"}
         total = 0
         for i, m in enumerate(msgs):
-            if m.kind == "text":
+            if m.kind in ("text", "edit"):  # edit — правка заявки клиентом через /order
                 text = m.text or ""
             elif m.kind == "voice" and not m.text:
                 text = "🎤 голосовое (расшифровка — в карточке)"

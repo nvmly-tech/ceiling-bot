@@ -257,6 +257,7 @@ async def test_client_messages_after_done_batched(env: Env):
     await env.tick(t0 + timedelta(seconds=61))
     [msg] = [m for m in env.group() if "дописал" in m.text]
     assert "• ещё хочу подсветку\n• и карниз" in msg.text
+    assert "/start" not in msg.text and "Квартира" not in msg.text  # ответы анкеты менеджер уже видел
 
     await env.client.text("и побыстрее")
     await env.tick(t0 + timedelta(minutes=5))

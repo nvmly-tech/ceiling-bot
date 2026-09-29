@@ -46,5 +46,13 @@ def restart(lead_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+def order(lead_id: int) -> InlineKeyboardMarkup:
+    """/order: что изменить в заявке. В callback — номер заявки: старая кнопка ничего не делает."""
+    fields = [InlineKeyboardButton(text=f"✏️ {label}", callback_data=f"edit:{field}:{lead_id}")
+              for field, label in texts.FIELD_LABELS.items()]
+    ok = InlineKeyboardButton(text=texts.ORDER_OK, callback_data=f"edit:ok:{lead_id}")
+    return InlineKeyboardMarkup(inline_keyboard=[fields[i : i + 2] for i in range(0, len(fields), 2)] + [[ok]])
+
+
 def remove() -> ReplyKeyboardRemove:
     return ReplyKeyboardRemove()
