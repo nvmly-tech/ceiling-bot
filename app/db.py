@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS tg_messages (
     lead_id    INTEGER NOT NULL,
     chat_id    INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
-    kind       TEXT NOT NULL,          -- lead | remind | client | digest (одна сводка — строка на каждую заявку)
+    kind       TEXT NOT NULL,          -- lead | remind | client | digest (строка на каждую заявку) | manager
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tg_messages_lead ON tg_messages(lead_id);
@@ -407,6 +407,16 @@ class Database:
         """Заявки, о которых одно сообщение (сводка)."""
         async with self.conn.execute(
             "SELECT lead_id FROM tg_messages WHERE chat_id = ? AND message_id = ? ORDER BY id", (chat_id, message_id)
+        ) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+    async def leads_by_phones(self, phones: Sequence[str]) -> list[int]:
+        """Живые заявки с этими номерами (+7XXXXXXXXXX) — для сообщений менеджеров, где упомянут телефон клиента."""
+        if not phones:
+            return []
+        marks = ", ".join("?" * len(phones))
+        async with self.conn.execute(
+            f"SELECT id FROM leads WHERE phone IN ({marks}) AND status != 'deleted' ORDER BY id", list(phones)
         ) as cur:
             return [r[0] for r in await cur.fetchall()]
 

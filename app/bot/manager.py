@@ -10,6 +10,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardMarkup, LinkPreviewOption
 
 from app.config import Settings
 from app.db import Database
+from app.parsing import replace_phones
 from app.services.health import HealthMonitor
 from app.services.notifier import Notifier
 
@@ -70,6 +71,22 @@ async def on_status(
     await message.answer(await monitor.status_text(), parse_mode="HTML")
 
 
+async def on_group_message(message: Message, db: Database, notifier: Notifier) -> None:
+    """Запомнить сообщение менеджера о заявке, чтобы удалить его, если клиент удалит заявку: ответ на сообщение
+    бота о заявке (и цепочки ответов) или сообщение с телефоном клиента. Текст не храним — только номер.
+    Бот видит все сообщения группы, потому что он администратор; ответы на свои сообщения — в любом случае."""
+    if message.chat.id != await notifier.chat_id():
+        return
+    lead_ids: set[int] = set()
+    if message.reply_to_message is not None:
+        lead_ids |= set(await db.tg_message_leads(message.chat.id, message.reply_to_message.message_id))
+    phones: list[str] = []
+    replace_phones(message.text or message.caption or "", lambda p: phones.append(p) or " ")
+    lead_ids |= set(await db.leads_by_phones(phones))
+    if lead_ids:
+        await db.add_tg_message(sorted(lead_ids), message.chat.id, message.message_id, "manager")
+
+
 async def on_migrate(message: Message, notifier: Notifier) -> None:
     """Служебное сообщение «группа стала супергруппой»: переходим на новый id сразу, не дожидаясь отправки —
     иначе «Взял» и /status из новой группы не принимались бы до следующего уведомления."""
@@ -81,4 +98,5 @@ def create_manager_router() -> Router:
     r.message.register(on_migrate, F.migrate_to_chat_id)
     r.callback_query.register(on_take, F.data.startswith("take:"))
     r.message.register(on_status, Command("status"))
+    r.message.register(on_group_message, F.chat.type.in_({"group", "supergroup"}))
     return r

@@ -105,3 +105,49 @@ async def test_message_left_in_old_group_after_migration(db):
     assert {c.chat_id for c in deletes} == {-5000}  # только в старом чате, в новый — не угадываем
     assert not await db.outbox_pending()  # и задача не застряла в ретраях
     assert "Заявка №1 удалена клиентом" in env.session.sent(-100777)[-1].text
+
+
+# --- ответы менеджеров с данными клиента ---
+
+
+async def manager_says(env: Env, message_id: int, text: str, reply_to: int | None = None, chat=None) -> None:
+    from aiogram.types import Message, Update
+
+    from tests.conftest import MANAGER, MANAGER_CHAT
+
+    chat = chat or MANAGER_CHAT
+    reply = Message(message_id=reply_to, date=datetime.now(UTC), chat=chat, text="…") if reply_to else None
+    msg = Message(message_id=message_id, date=datetime.now(UTC), chat=chat, from_user=MANAGER, text=text,
+                  reply_to_message=reply)
+    await env.client.dp.feed_update(env.client.bot, Update(update_id=10_000 + message_id, message=msg))
+
+
+async def test_manager_replies_and_phone_mentions_deleted_with_lead(db):
+    env = await lead_with_two_notifications(db)
+    [notification] = [m.message_id for m in await db.tg_messages(1) if m.kind == "lead"]
+    await manager_says(env, 701, "Позвонил, договорились на субботу", reply_to=notification)  # ответ на уведомление
+    await manager_says(env, 702, "Адрес скинула в личку", reply_to=701)  # ответ на ответ — та же заявка
+    await manager_says(env, 703, "Кто звонил на 8 900 123-45-67? Перезвоните")  # телефон клиента
+    await manager_says(env, 704, "Всем доброе утро!")  # не о заявке
+    ours = {m.message_id for m in await db.tg_messages(1) if m.kind == "manager"}
+    assert ours == {701, 702, 703}  # тексты не храним — только номера
+
+    await db.delete_lead_data(1)
+    await env.tick()
+    assert {701, 702, 703} <= set(env.session.deleted()) and 704 not in env.session.deleted()
+
+
+async def test_messages_in_other_chats_not_tracked(db):
+    from aiogram.types import Chat
+
+    env = await lead_with_two_notifications(db)
+    await manager_says(env, 705, "8 900 123-45-67", chat=Chat(id=-9999, type="supergroup", title="Другая"))
+    assert not [m for m in await db.tg_messages(1) if m.kind == "manager"]
+
+
+async def test_phone_of_deleted_lead_not_matched(db):
+    env = await lead_with_two_notifications(db)
+    await db.delete_lead_data(1)
+    await env.tick()
+    await manager_says(env, 706, "8 900 123-45-67")  # заявки уже нет — привязывать не к чему
+    assert await db.tg_messages(1) == []
