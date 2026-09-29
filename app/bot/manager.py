@@ -36,6 +36,15 @@ async def on_take(cb: CallbackQuery, db: Database, settings: Settings, notifier:
     if lead is None:
         await cb.answer("Заявка не найдена", show_alert=True)
         return
+    if lead.status == "deleted":
+        # Сообщение старше 48 ч осталось в группе (Telegram не дал удалить) — взять заявку уже нельзя.
+        await cb.answer(f"Заявка №{lead_id} удалена клиентом", show_alert=True)
+        # Убираем «Взял» этой заявки и ссылку на клиента; кнопки других заявок (в сводке) остаются.
+        rest = _without_take(cb.message.reply_markup, lead_id)
+        rows = [[b for b in row if not b.url] for row in rest.inline_keyboard] if rest else []
+        rows = [row for row in rows if row]
+        await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
+        return
     by = cb.from_user.full_name
     if await db.take_lead(lead_id, by_id=cb.from_user.id, by_name=by):
         await cb.answer(f"Заявка №{lead_id} ваша 👍")

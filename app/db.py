@@ -59,6 +59,17 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(done_at, id);
 
+-- Сообщения бота о заявке в группе менеджеров: чтобы удалить их, если клиент удалит заявку.
+CREATE TABLE IF NOT EXISTS tg_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_id    INTEGER NOT NULL,
+    chat_id    INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    kind       TEXT NOT NULL,          -- lead | remind | client | digest (одна сводка — строка на каждую заявку)
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS tg_messages_lead ON tg_messages(lead_id);
+
 CREATE TABLE IF NOT EXISTS fsm (
     key   TEXT PRIMARY KEY,
     state TEXT,
@@ -176,6 +187,16 @@ class Message:
     created_at: str
     text_alt: str | None = None
     text_alt_model: str | None = None
+
+
+@dataclass
+class TgMessage:
+    id: int
+    lead_id: int
+    chat_id: int
+    message_id: int
+    kind: str
+    created_at: str
 
 
 @dataclass
@@ -365,9 +386,33 @@ class Database:
         )
         if lead.trello_card_id or card_planned:
             await self._enqueue(CARD_DELETE, lead_id)
-        if lead.notified_at:
-            await self._enqueue(TG_DELETED, lead_id)
+        if lead.notified_at or await self.tg_messages(lead_id):
+            await self._enqueue(TG_DELETED, lead_id)  # сообщить менеджеру и убрать сообщения о заявке из группы
         await self._commit()
+
+    # --- сообщения бота в группе менеджеров ---
+
+    async def add_tg_message(self, lead_ids: Sequence[int], chat_id: int, message_id: int, kind: str) -> None:
+        await self.conn.executemany(
+            "INSERT INTO tg_messages (lead_id, chat_id, message_id, kind, created_at) VALUES (?, ?, ?, ?, ?)",
+            [(lead_id, chat_id, message_id, kind, now_iso()) for lead_id in lead_ids],
+        )
+        await self.conn.commit()
+
+    async def tg_messages(self, lead_id: int) -> list[TgMessage]:
+        async with self.conn.execute("SELECT * FROM tg_messages WHERE lead_id = ? ORDER BY id", (lead_id,)) as cur:
+            return [TgMessage(**dict(r)) for r in await cur.fetchall()]
+
+    async def tg_message_leads(self, chat_id: int, message_id: int) -> list[int]:
+        """Заявки, о которых одно сообщение (сводка)."""
+        async with self.conn.execute(
+            "SELECT lead_id FROM tg_messages WHERE chat_id = ? AND message_id = ? ORDER BY id", (chat_id, message_id)
+        ) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+    async def delete_tg_messages(self, lead_id: int) -> None:
+        await self.conn.execute("DELETE FROM tg_messages WHERE lead_id = ?", (lead_id,))
+        await self.conn.commit()
 
     # --- переписка ---
 

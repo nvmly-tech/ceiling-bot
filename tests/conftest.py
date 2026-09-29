@@ -6,9 +6,11 @@ from typing import Any
 import pytest
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
-from aiogram.exceptions import TelegramMigrateToChat
+from aiogram.exceptions import TelegramBadRequest, TelegramMigrateToChat
 from aiogram.methods import (
     AnswerCallbackQuery,
+    DeleteMessage,
+    EditMessageReplyMarkup,
     EditMessageText,
     GetFile,
     GetUpdates,
@@ -41,6 +43,7 @@ class FakeSession(BaseSession):
         self._msg_id = 1000
         self.migrate: dict[int, int] = {}  # chat_id → новый id: имитация превращения группы в супергруппу
         self.downloads: list[str] = []
+        self.undeletable: set[int] = set()  # message_id, которые Telegram откажется удалять
 
     async def make_request(self, bot: Bot, method: TelegramMethod, timeout: int | None = None) -> Any:
         if isinstance(method, SendMessage) and method.chat_id in self.migrate:
@@ -52,6 +55,12 @@ class FakeSession(BaseSession):
             chat_id = method.chat_id or CHAT.id
             chat = CHAT if chat_id == CHAT.id else Chat(id=chat_id, type="group")
             return Message(message_id=self._msg_id, date=datetime.now(UTC), chat=chat, text=method.text)
+        if isinstance(method, EditMessageReplyMarkup):
+            return True
+        if isinstance(method, DeleteMessage):
+            if method.message_id in self.undeletable:
+                raise TelegramBadRequest(method=method, message="Bad Request: message can't be deleted")
+            return True
         if isinstance(method, (AnswerCallbackQuery, SendChatAction)):
             return True
         if isinstance(method, GetUpdates):
@@ -70,6 +79,9 @@ class FakeSession(BaseSession):
 
     def sent(self, chat_id: int | None = None) -> list[SendMessage]:
         return [c for c in self.calls if isinstance(c, SendMessage) and (chat_id is None or c.chat_id == chat_id)]
+
+    def deleted(self) -> list[int]:
+        return [c.message_id for c in self.calls if isinstance(c, DeleteMessage)]
 
     def edits(self) -> list[EditMessageText]:
         return [c for c in self.calls if isinstance(c, EditMessageText)]

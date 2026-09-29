@@ -7,12 +7,13 @@
 import asyncio
 import logging
 import re
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from html import escape, unescape
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramMigrateToChat
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
+from aiogram.exceptions import TelegramBadRequest, TelegramMigrateToChat
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
 
 from app.bot.assistant import LeadAssistant
 from app.config import Settings
@@ -32,6 +33,8 @@ CLIENT_TOTAL_MAX = 3000             # и всех строк вместе
 # Резюме — дополнение, а не суть уведомления. Очередь outbox однопоточная: пока ждём LLM, стоят и Trello,
 # и другие уведомления. Без бюджета две «висящие» модели держали бы её 2×LLM_TIMEOUT_SEC (~30 с).
 SUMMARY_BUDGET = 8                  # с
+# Telegram даёт боту удалять свои сообщения только 48 ч; берём с запасом — удаление идёт через очередь.
+TG_DELETE_WINDOW = timedelta(hours=47)
 
 
 class NotReady(Exception):
@@ -160,7 +163,11 @@ class Notifier:
         now = datetime.now(self.settings.zone)
         return not is_work_time(now, self.settings.work_start, self.settings.work_end)
 
-    async def _send(self, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
+    async def _send(
+        self, text: str, markup: InlineKeyboardMarkup | None = None, *, lead_ids: Sequence[int] = (), kind: str = "",
+    ) -> Message:
+        """Сообщение в группу менеджеров. lead_ids — о каких заявках: номер сообщения запоминаем, чтобы удалить
+        его, если клиент удалит заявку."""
         chat_id = await self.chat_id()
         if chat_id is None:
             raise NotReady("MANAGER_CHAT_ID не задан")
@@ -178,13 +185,16 @@ class Notifier:
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
         try:
-            await self.bot.send_message(chat_id, **kwargs)
+            sent = await self.bot.send_message(chat_id, **kwargs)
         except TelegramMigrateToChat as e:
             # Группу превратили в супергруппу — у неё новый id. Запоминаем и шлём туда.
             new_id = e.migrate_to_chat_id
             await self.db.kv_set(KV_CHAT_ID, str(new_id))
             log.error("Чат менеджеров сменил id: %s → %s. Обновите MANAGER_CHAT_ID в env-файле.", chat_id, new_id)
-            await self.bot.send_message(new_id, **kwargs)
+            sent = await self.bot.send_message(new_id, **kwargs)
+        if lead_ids:
+            await self.db.add_tg_message(lead_ids, sent.chat.id, sent.message_id, kind)
+        return sent
 
     async def _lead(self, task: OutboxTask) -> Lead:
         lead = await self.db.get_lead(task.lead_id)
@@ -217,14 +227,15 @@ class Notifier:
         if lead.taken_at:
             return
         lead = await self._summarize(lead)
-        await self._send(lead_text(lead, task.payload["reason"]), lead_keyboard(lead))
+        await self._send(lead_text(lead, task.payload["reason"]), lead_keyboard(lead), lead_ids=[lead.id], kind="lead")
 
     async def send_reminder(self, task: OutboxTask) -> None:
         lead = await self._lead(task)
         if lead.taken_at:
             return
         waiting = datetime.now(UTC) - next_work_start(datetime.fromisoformat(lead.notified_at), self.settings)
-        await self._send(lead_text(lead, "remind", max(1, int(waiting.total_seconds() // 60))), lead_keyboard(lead))
+        text = lead_text(lead, "remind", max(1, int(waiting.total_seconds() // 60)))
+        await self._send(text, lead_keyboard(lead), lead_ids=[lead.id], kind="remind")
 
     async def send_client_messages(self, task: OutboxTask) -> None:
         lead = await self._lead(task)
@@ -252,15 +263,42 @@ class Notifier:
         if lead.trello_card_url:
             lines.append(f'📋 <a href="{escape(lead.trello_card_url)}">Карточка в Trello</a>')
         markup = None if lead.taken_at else lead_keyboard(lead)
-        await self._send("\n".join(lines), markup)
+        await self._send("\n".join(lines), markup, lead_ids=[lead.id], kind="client")
         await self.db.update_lead(lead.id, client_msgs_notified=msgs[-1].id)
 
     async def send_deleted(self, task: OutboxTask) -> None:
-        """Клиент удалил заявку. Личных данных в сообщении нет — их уже стёрли."""
+        """Клиент удалил заявку: убрать сообщения о ней из группы и сообщить менеджеру (без личных данных)."""
+        await self._forget_group_messages(task.lead_id)
         await self._send(
             f"🗑 <b>Заявка №{task.lead_id} удалена клиентом</b>\n"
             "По его просьбе стёрты анкета, переписка и карточка в Trello."
         )
+
+    async def _forget_group_messages(self, lead_id: int) -> None:
+        """Удалить сообщения о заявке из группы. Telegram даёт удалять только 48 ч — более старые остаются.
+        Сводку, где есть и другие заявки, не удаляем, а пересобираем без этой."""
+        cutoff = datetime.now(UTC) - TG_DELETE_WINDOW
+        for m in await self.db.tg_messages(lead_id):
+            if datetime.fromisoformat(m.created_at) < cutoff:
+                continue
+            others = []
+            if m.kind == "digest":
+                for i in await self.db.tg_message_leads(m.chat_id, m.message_id):
+                    if i != lead_id and (lead := await self.db.get_lead(i)) and lead.status != "deleted":
+                        others.append(lead)
+            try:
+                if others:
+                    await self.bot.edit_message_text(
+                        digest_text(others), chat_id=m.chat_id, message_id=m.message_id, parse_mode="HTML",
+                        reply_markup=digest_keyboard([x for x in others if not x.taken_at]),
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    )
+                else:
+                    await self.bot.delete_message(m.chat_id, m.message_id)
+            except TelegramBadRequest as e:
+                # Уже удалено вручную, слишком старое и т.п. — не повод держать задачу в ретраях.
+                log.warning("Сообщение %s о заявке %s не убрано из группы: %s", m.message_id, lead_id, e.message)
+        await self.db.delete_tg_messages(lead_id)
 
     async def send_digest(self, task: OutboxTask) -> None:
         leads = [
@@ -268,7 +306,7 @@ class Notifier:
             if (lead := await self.db.get_lead(i)) and not lead.taken_at and lead.status != "deleted"
         ]
         if leads:
-            await self._send(digest_text(leads), digest_keyboard(leads))
+            await self._send(digest_text(leads), digest_keyboard(leads), lead_ids=[x.id for x in leads], kind="digest")
 
     # --- планировщик ---
 
