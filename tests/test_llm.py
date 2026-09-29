@@ -468,3 +468,29 @@ async def test_made_up_price_goes_to_next_model():
                         FakeProvider("groq", turn("Тканевый — от 1 700 ₽/м², точнее — на замере."))])
     result, model = await router.json([{"role": "user", "content": "сколько?"}], parse_turn)
     assert model == "groq" and "1 700" in result.reply
+
+
+@pytest.mark.parametrize(("current", "new", "expected"), [
+    ("Квартира", "спальня", "Квартира, спальня"),              # уточнение комнаты дописывается к типу
+    ("Квартира, спальня", "кухня", "Квартира, кухня"),          # другая комната — тип остаётся
+    ("Квартира", "дом", "дом"),                                 # сменили тип — это исправление
+    ("Квартира", "квартира, спальня и зал", "квартира, спальня и зал"),  # модель уже вернула всё вместе
+    ("двушка", "детская", "двушка, детская"),
+    ("спальня", "кухня", "кухня"),                              # типа не было — просто новое значение
+    (None, "спальня", "спальня"),
+    ("Коммерческое помещение", "торговый зал", "Коммерческое помещение, торговый зал"),
+])
+def test_merge_object(current, new, expected):
+    from app.bot.assistant import merge_object
+
+    assert merge_object(current, new) == expected
+
+
+async def test_room_after_object_button_keeps_type(db):
+    ds = FakeProvider("deepseek", turn("Спальня, около 18 м². Какой потолок интересует?", asks="ceiling_type",
+                                       object="спальня", area_m2=18))
+    client, _ = make_client(db, ds)
+    await client.text("/start")
+    await client.press("obj:flat")
+    await client.text("в спальню, метров 18 примерно")
+    assert (await db.last_lead(USER.id)).object == "Квартира, спальня"

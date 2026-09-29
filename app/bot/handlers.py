@@ -32,7 +32,7 @@ from aiogram.types import (
 )
 
 from app.bot import keyboards, texts
-from app.bot.assistant import LeadAssistant, known_fields, missing_fields
+from app.bot.assistant import LeadAssistant, known_fields, merge_object, missing_fields
 from app.bot.states import EDITS, QUESTIONS, EditLead, Lead
 from app.config import Settings
 from app.db import STT_SHADOW, STT_TRANSCRIBE, TG_CLIENT_MSG, Database, now_iso
@@ -253,6 +253,8 @@ async def llm_turn(
     if not logged:
         await log_in(db, lead_id, item, STATE_FIELD.get(current))
     if turn.updates:
+        if "object" in turn.updates:  # «в спальню» после кнопки «Квартира» — дописываем, а не заменяем
+            turn.updates["object"] = merge_object(lead.object, turn.updates["object"])
         lead = await db.update_lead(lead_id, **turn.updates)
 
     if done:

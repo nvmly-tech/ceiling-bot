@@ -5,6 +5,7 @@
 """
 
 import json
+import re
 from collections.abc import Collection
 from dataclasses import dataclass
 from functools import partial
@@ -100,6 +101,23 @@ class Turn:
     updates: dict[str, Any]  # поля лида для db.update_lead
     asks: str | None = None  # про какое поле вопрос в конце reply (None — ничего не спрашивает)
     model: str = ""
+
+
+# Тип помещения (в отличие от комнаты): по нему видно, что клиент меняет сам объект, а не уточняет комнату.
+_OBJECT_TYPE = re.compile(
+    r"\b(квартир\w*|дом\w{0,2}|частн\w*|коттедж\w*|таунхаус\w*|дач\w*|офис\w*|коммерч\w*|магазин\w*|"
+    r"кафе|ресторан\w*|салон\w*|склад\w*|студи[яюи]|однушк\w*|двушк\w*|тр[её]шк\w*|\w+комнатн\w*)\b",
+    re.IGNORECASE,
+)
+
+
+def merge_object(current: str | None, new: str) -> str:
+    """Что записать в «помещение», если оно уже известно. Кнопка «Квартира», потом «в спальню» —
+    «Квартира, спальня»: комната уточняет тип, а не заменяет его. Новый тип («нет, это дом») — исправление."""
+    if not current or _OBJECT_TYPE.search(new):
+        return new
+    kind = current.split(",")[0].strip()
+    return f"{kind}, {new}" if _OBJECT_TYPE.search(kind) else new
 
 
 def check_amounts(reply: str, allowed: Collection[int]) -> None:
