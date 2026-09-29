@@ -10,7 +10,7 @@ from app.db import TG_DIGEST, TG_LEAD, TG_REMIND, Database
 from app.main import build_dispatcher
 from app.services.notifier import KV_CHAT_ID, Notifier, next_work_start
 from app.services.outbox import Outbox
-from tests.conftest import MANAGER, MANAGER2, USER, Client, FakeSession
+from tests.conftest import MANAGER, MANAGER2, MANAGER_CHAT, USER, Client, FakeSession
 from tests.test_trello import FakeTrello, complete_dialog, make_sync
 
 GROUP = -5000
@@ -275,3 +275,14 @@ async def test_group_migration_switches_chat(env: Env):
     assert await env.db.kv_get(KV_CHAT_ID) == "-100777"
     assert "Новая заявка" in env.session.sent(-100777)[0].text
     assert await env.notifier.chat_id() == -100777
+
+
+async def test_group_migration_service_message_switches_chat_at_once(env: Env):
+    # Telegram присылает в старую группу служебное сообщение о переходе в супергруппу — переходим сразу,
+    # не дожидаясь следующей отправки (иначе «Взял» и /status из новой группы не принимались бы).
+    from aiogram.types import Message, Update
+
+    migrated = Message(message_id=900, date=datetime.now(UTC), chat=MANAGER_CHAT, migrate_to_chat_id=-100777)
+    await env.client.dp.feed_update(env.client.bot, Update(update_id=9000, message=migrated))
+    assert await env.notifier.chat_id() == -100777
+    assert await env.db.kv_get(KV_CHAT_ID) == "-100777"

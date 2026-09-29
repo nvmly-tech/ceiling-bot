@@ -70,8 +70,15 @@ async def on_status(
     await message.answer(await monitor.status_text(), parse_mode="HTML")
 
 
+async def on_migrate(message: Message, notifier: Notifier) -> None:
+    """Служебное сообщение «группа стала супергруппой»: переходим на новый id сразу, не дожидаясь отправки —
+    иначе «Взял» и /status из новой группы не принимались бы до следующего уведомления."""
+    await notifier.switch_chat(message.chat.id, message.migrate_to_chat_id)
+
+
 def create_manager_router() -> Router:
     r = Router(name="manager")
+    r.message.register(on_migrate, F.migrate_to_chat_id)
     r.callback_query.register(on_take, F.data.startswith("take:"))
     r.message.register(on_status, Command("status"))
     return r

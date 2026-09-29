@@ -93,3 +93,15 @@ async def test_take_button_on_old_message_of_deleted_lead(db):
     assert [t.kind for t in await db.outbox_pending()] == []  # в Trello ничего не уходит
     [markup_edit] = [c for c in env.session.calls if type(c).__name__ == "EditMessageReplyMarkup"]
     assert markup_edit.reply_markup is None  # кнопку «Взял» убрали
+
+
+async def test_message_left_in_old_group_after_migration(db):
+    env = await lead_with_two_notifications(db)
+    env.session.migrate[-5000] = -100777  # группу превратили в супергруппу после уведомлений
+    await db.delete_lead_data(1)
+    await env.tick()
+    # Номера сообщений в новой супергруппе могут не совпадать — удалять «наугад» нельзя: пропускаем.
+    deletes = [c for c in env.session.calls if type(c).__name__ == "DeleteMessage"]
+    assert {c.chat_id for c in deletes} == {-5000}  # только в старом чате, в новый — не угадываем
+    assert not await db.outbox_pending()  # и задача не застряла в ретраях
+    assert "Заявка №1 удалена клиентом" in env.session.sent(-100777)[-1].text

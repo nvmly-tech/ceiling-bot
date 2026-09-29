@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from html import escape, unescape
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramMigrateToChat
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramMigrateToChat
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
 
 from app.bot.assistant import LeadAssistant
@@ -153,6 +153,13 @@ class Notifier:
             TG_DIGEST: self.send_digest,
             TG_DELETED: self.send_deleted,
         }
+
+    async def switch_chat(self, old_id: int, new_id: int) -> None:
+        """Группу менеджеров превратили в супергруппу — у неё новый id (служебное сообщение Telegram)."""
+        if old_id != await self.chat_id():
+            return
+        await self.db.kv_set(KV_CHAT_ID, str(new_id))
+        log.error("Чат менеджеров сменил id: %s → %s. Обновите MANAGER_CHAT_ID в env-файле.", old_id, new_id)
 
     async def chat_id(self) -> int | None:
         override = await self.db.kv_get(KV_CHAT_ID)
@@ -295,8 +302,9 @@ class Notifier:
                     )
                 else:
                     await self.bot.delete_message(m.chat_id, m.message_id)
-            except TelegramBadRequest as e:
-                # Уже удалено вручную, слишком старое и т.п. — не повод держать задачу в ретраях.
+            except (TelegramBadRequest, TelegramForbiddenError, TelegramMigrateToChat) as e:
+                # Уже удалено вручную, слишком старое, бота убрали из группы или группа стала супергруппой
+                # (номера сообщений там могут быть другими — удалять «наугад» нельзя) — не повод для ретраев.
                 log.warning("Сообщение %s о заявке %s не убрано из группы: %s", m.message_id, lead_id, e.message)
         await self.db.delete_tg_messages(lead_id)
 

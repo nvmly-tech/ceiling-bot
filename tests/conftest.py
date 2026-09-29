@@ -58,6 +58,9 @@ class FakeSession(BaseSession):
         if isinstance(method, EditMessageReplyMarkup):
             return True
         if isinstance(method, DeleteMessage):
+            if method.chat_id in self.migrate:
+                new_id = self.migrate[method.chat_id]
+                raise TelegramMigrateToChat(method=method, message="migrated", migrate_to_chat_id=new_id)
             if method.message_id in self.undeletable:
                 raise TelegramBadRequest(method=method, message="Bad Request: message can't be deleted")
             return True
