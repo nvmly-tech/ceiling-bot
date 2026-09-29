@@ -20,6 +20,7 @@ from app.db import (
     CARD_ATTACH,
     CARD_COMMENT,
     CARD_CREATE,
+    CARD_DELETE,
     CARD_TAKE,
     CARD_TRANSCRIPT,
     CARD_UPDATE,
@@ -107,6 +108,13 @@ class TrelloClient:
 
     async def update_card(self, card_id: str, **fields: Any) -> dict:
         return await self._call("PUT", f"/cards/{card_id}", fields)
+
+    async def delete_card(self, card_id: str) -> None:
+        try:
+            await self._call("DELETE", f"/cards/{card_id}")
+        except TrelloError as e:
+            if "HTTP 404" not in str(e):
+                raise  # 404 — карточки уже нет (удалили вручную или повтор задачи): это успех
 
     async def add_comment(self, card_id: str, text: str) -> dict:
         return await self._call("POST", f"/cards/{card_id}/actions/comments", {"text": text[:COMMENT_LIMIT]})
@@ -239,6 +247,7 @@ class TrelloSync:
             CARD_TAKE: self.take_card,
             CARD_ATTACH: self.attach_file,
             CARD_TRANSCRIPT: self.add_transcript,
+            CARD_DELETE: self.delete_card,
         }
 
     async def board(self) -> Board:
@@ -282,14 +291,21 @@ class TrelloSync:
 
     async def create_card(self, task: OutboxTask) -> None:
         lead = await self._lead(task)
-        if lead.trello_card_id:
-            return  # уже создана (повтор задачи после сбоя)
+        if lead.trello_card_id or lead.status == "deleted":
+            return  # уже создана (повтор задачи после сбоя) или клиент удалил заявку
         board = await self.board()
         card = await self.client.create_card(
             board.list_new, card_name(lead), card_desc(lead, self.zone), self.label_ids(lead, board)
         )
         await self.db.update_lead(lead.id, trello_card_id=card["id"], trello_card_url=card.get("shortUrl"))
         log.info("Trello: карточка для лида %s создана: %s", lead.id, card.get("shortUrl"))
+
+    async def delete_card(self, task: OutboxTask) -> None:
+        """Клиент удалил заявку: карточка удаляется вместе с перепиской и вложениями."""
+        lead = await self._lead(task)
+        if lead.trello_card_id:
+            await self.client.delete_card(lead.trello_card_id)
+            await self.db.update_lead(lead.id, trello_card_id=None, trello_card_url=None)
 
     async def update_card(self, task: OutboxTask) -> None:
         lead = await self._lead(task)

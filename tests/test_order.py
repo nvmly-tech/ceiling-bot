@@ -28,7 +28,7 @@ async def test_order_shows_lead_with_edit_buttons(client: Client, db):
                  "Время замера: в субботу"):
         assert line in view
     assert buttons(client) == ["edit:object:1", "edit:area:1", "edit:ceiling_type:1", "edit:phone:1",
-                               "edit:measure_time:1", "edit:ok:1"]
+                               "edit:measure_time:1", "delete:ask:1", "edit:ok:1"]
     # Просмотр — не часть переписки: в базе (и в карточке) его нет.
     assert "/order" not in [m.text for m in await db.get_messages(1)]
 
@@ -138,3 +138,78 @@ async def test_edit_phone_by_contact_and_time_by_voice(client: Client, db):
     assert task.payload["field"] == "measure_time"  # расшифровка ляжет именно в правленое поле
     kinds = [m.kind for m in await db.get_messages(1)][-4:]
     assert kinds == ["contact", "edit", "voice", "edit"]  # контакт и голос — в переписке (вложение, расшифровка)
+
+
+# --- удаление заявки ---
+
+
+async def test_delete_asks_confirmation_and_no_keeps_lead(client: Client, db):
+    await complete_dialog(client)
+    await client.text("/order")
+    assert "delete:ask:1" in buttons(client)
+    await client.press("delete:ask:1")
+    assert client.last_text() == texts.DELETE_CONFIRM.format(lead_id=1)
+    assert buttons(client) == ["delete:yes:1", "delete:no:1"]
+    await client.press("delete:no:1")
+    assert client.last_text() == texts.DELETE_KEPT
+    lead = await db.get_lead(1)
+    assert lead.status == "qualified" and lead.phone == "+79001234567"
+
+
+async def test_delete_wipes_data_card_and_tells_manager(db):
+    env: Env = await make_env(db)
+    await complete_dialog(env.client)
+    t0 = datetime.now(UTC)
+    await env.tick(t0)  # карточка создана, менеджер уведомлён
+    assert env.trello.cards and env.group()
+    await env.client.text("/order")
+    await env.client.press("delete:ask:1")
+    await env.client.press("delete:yes:1")
+    assert env.client.last_text() == texts.DELETED.format(lead_id=1)
+
+    lead = await db.get_lead(1)  # строка обезличена: остались номер и отметка «удалена»
+    assert lead.status == "deleted" and lead.tg_user_id == 0 and lead.chat_id == 0
+    assert (lead.name, lead.username, lead.phone, lead.object, lead.area_text, lead.ceiling_type,
+            lead.measure_time, lead.summary) == (None,) * 8
+    assert await db.get_messages(1) == []
+    assert await db.last_lead(USER.id) is None
+
+    await env.tick(t0 + timedelta(seconds=1))
+    assert env.trello.cards == {}  # карточка удалена вместе с перепиской и вложениями
+    assert (await db.get_lead(1)).trello_card_id is None
+    notice = env.group()[-1].text
+    assert "Заявка №1 удалена клиентом" in notice
+    assert "Анна" not in notice and "79001234567" not in notice  # в уведомлении нет личных данных
+
+    await env.client.text("/order")
+    assert env.client.last_text() == texts.ORDER_NONE
+    await env.client.text("/start")  # можно оставить новую
+    assert (await db.last_lead(USER.id)).id == 2
+
+
+async def test_delete_before_card_created_cancels_pending_tasks(db):
+    env: Env = await make_env(db)
+    await env.client.text("/start")
+    await env.client.press("obj:flat")  # карточка и комментарии ещё в очереди
+    await env.client.text("/order")
+    await env.client.press("delete:ask:1")
+    await env.client.press("delete:yes:1")
+    await env.tick()
+    await env.tick()
+    assert env.trello.cards == {} and env.group() == []  # ни карточки, ни уведомления менеджеру
+    assert [t.kind for t in await db.outbox_pending()] == []
+
+
+async def test_stale_delete_buttons_ignored(client: Client, db):
+    await complete_dialog(client)
+    await client.press("delete:yes:7")  # чужая заявка
+    await client.press("delete:yes:1")  # без подтверждения (кнопки «Да» не показывали) — тоже нельзя
+    assert (await db.get_lead(1)).status == "qualified"
+
+
+async def test_deleted_lead_not_in_reminders(db):
+    lead = await db.create_lead(tg_user_id=1, chat_id=1, name="А", username=None, is_night=False)
+    await db.update_lead(lead.id, status="qualified", notified_status="qualified",
+                         notified_at="2026-09-29T10:00:00+00:00")
+    await db.delete_lead_data(lead.id)
+    assert await db.leads_waiting() == []

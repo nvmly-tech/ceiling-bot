@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS leads (
     ceiling_type  TEXT,
     phone         TEXT,
     measure_time  TEXT,
-    status        TEXT NOT NULL DEFAULT 'new',   -- new | qualified | abandoned | cancelled (закрыта клиентом)
+    status        TEXT NOT NULL DEFAULT 'new',   -- new | qualified | abandoned | cancelled (закрыта клиентом) | deleted
     is_night      INTEGER NOT NULL DEFAULT 0,
     trello_card_id TEXT,
     created_at    TEXT NOT NULL,
@@ -110,14 +110,16 @@ CARD_COMMENT = "trello.comment"
 CARD_TAKE = "trello.card_take"
 CARD_ATTACH = "trello.attach"          # приложить файл сообщения (голосовое, фото, документ)
 CARD_TRANSCRIPT = "trello.transcript"  # комментарий с отложенной расшифровкой голосового
+CARD_DELETE = "trello.card_delete"     # клиент удалил заявку — удалить карточку
 STT_TRANSCRIBE = "stt.transcribe"      # отложенная расшифровка голосового
 STT_SHADOW = "shadow.stt"              # теневая расшифровка другой моделью — только для сравнения, клиенту не видна
 TG_LEAD = "tg.lead"                # уведомление о новом / брошенном лиде
 TG_REMIND = "tg.remind"            # напоминание: лид никто не взял
 TG_CLIENT_MSG = "tg.client_msg"    # клиент дописал после анкеты
 TG_DIGEST = "tg.digest"            # утренний дайджест ночных лидов
-ALL_KINDS = (CARD_CREATE, CARD_UPDATE, CARD_COMMENT, CARD_TAKE, CARD_ATTACH, CARD_TRANSCRIPT, STT_TRANSCRIBE,
-             STT_SHADOW, TG_LEAD, TG_REMIND, TG_CLIENT_MSG, TG_DIGEST)
+TG_DELETED = "tg.deleted"          # клиент удалил заявку, о которой менеджер уже знал
+ALL_KINDS = (CARD_CREATE, CARD_UPDATE, CARD_COMMENT, CARD_TAKE, CARD_ATTACH, CARD_TRANSCRIPT, CARD_DELETE,
+             STT_TRANSCRIBE, STT_SHADOW, TG_LEAD, TG_REMIND, TG_CLIENT_MSG, TG_DIGEST, TG_DELETED)
 
 Event = tuple[str, dict[str, Any]]
 
@@ -336,7 +338,36 @@ class Database:
 
     async def leads_waiting(self) -> list[Lead]:
         """Менеджер уведомлён, но лид никто не взял (закрытые клиентом — не в счёт: о них не напоминаем)."""
-        return await self._leads("notified_at IS NOT NULL AND taken_at IS NULL AND status != 'cancelled'")
+        return await self._leads(
+            "notified_at IS NOT NULL AND taken_at IS NULL AND status NOT IN ('cancelled', 'deleted')"
+        )
+
+    async def delete_lead_data(self, lead_id: int) -> None:
+        """Клиент удалил заявку: стереть его данные в одной транзакции. Остаётся обезличенная строка (номер и
+        status='deleted') — по ней очередь удалит карточку Trello, если она есть или создаётся прямо сейчас."""
+        lead = await self.get_lead(lead_id)
+        if lead is None or lead.status == "deleted":
+            return
+        # Карточка есть, создаётся прямо сейчас или ждёт настройки Trello — её надо будет удалить.
+        async with self.conn.execute(
+            "SELECT 1 FROM outbox WHERE lead_id = ? AND kind = ?", (lead_id, CARD_CREATE)
+        ) as cur:
+            card_planned = await cur.fetchone() is not None
+        # Невыполненные задачи (карточка, комментарии, уведомления, расшифровки) больше не нужны.
+        await self.conn.execute("DELETE FROM outbox WHERE lead_id = ? AND done_at IS NULL", (lead_id,))
+        await self.conn.execute("DELETE FROM messages WHERE lead_id = ?", (lead_id,))
+        await self.conn.execute(
+            "UPDATE leads SET status = 'deleted', tg_user_id = 0, chat_id = 0, name = NULL, username = NULL,"
+            " object = NULL, area_m2 = NULL, area_text = NULL, ceiling_type = NULL, phone = NULL,"
+            " measure_time = NULL, summary = NULL, hotness = NULL, hotness_reason = NULL, summary_model = NULL,"
+            " summary_status = NULL, updated_at = ? WHERE id = ?",
+            (now_iso(), lead_id),
+        )
+        if lead.trello_card_id or card_planned:
+            await self._enqueue(CARD_DELETE, lead_id)
+        if lead.notified_at:
+            await self._enqueue(TG_DELETED, lead_id)
+        await self._commit()
 
     # --- переписка ---
 

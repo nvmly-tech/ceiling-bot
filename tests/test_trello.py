@@ -66,6 +66,10 @@ class FakeTrello(TrelloClient):
         card.update(fields)
         return card
 
+    async def delete_card(self, card_id):
+        self._maybe_fail("delete_card")
+        self.cards.pop(card_id, None)  # как у настоящего клиента: уже удалённая — не ошибка
+
     async def add_comment(self, card_id, text):
         self._maybe_fail("add_comment")
         self.cards[card_id]["comments"].append(text)
@@ -106,6 +110,19 @@ async def test_client_sends_auth_and_json():
     req = route.calls.last.request
     assert req.url.params["key"] == "KEY" and req.url.params["token"] == "TOKEN"
     assert json.loads(req.read()) == {"idList": "L1", "name": "Имя", "desc": "Описание", "idLabels": "B1,B2"}
+    await client.close()
+
+
+@respx.mock
+async def test_client_delete_card_treats_404_as_done():
+    client = TrelloClient("KEY", "TOKEN")
+    respx.delete("https://api.trello.com/1/cards/C1").mock(return_value=httpx.Response(200, json={"_value": None}))
+    respx.delete("https://api.trello.com/1/cards/GONE").mock(return_value=httpx.Response(404, text="not found"))
+    respx.delete("https://api.trello.com/1/cards/ERR").mock(return_value=httpx.Response(500, text="oops"))
+    await client.delete_card("C1")
+    await client.delete_card("GONE")  # уже удалена — повтор задачи не зацикливается
+    with pytest.raises(TrelloError, match="HTTP 500"):
+        await client.delete_card("ERR")  # настоящая ошибка — в ретрай
     await client.close()
 
 

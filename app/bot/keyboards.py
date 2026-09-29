@@ -50,8 +50,17 @@ def order(lead_id: int) -> InlineKeyboardMarkup:
     """/order: что изменить в заявке. В callback — номер заявки: старая кнопка ничего не делает."""
     fields = [InlineKeyboardButton(text=f"✏️ {label}", callback_data=f"edit:{field}:{lead_id}")
               for field, label in texts.FIELD_LABELS.items()]
+    delete = InlineKeyboardButton(text=texts.ORDER_DELETE, callback_data=f"delete:ask:{lead_id}")
     ok = InlineKeyboardButton(text=texts.ORDER_OK, callback_data=f"edit:ok:{lead_id}")
-    return InlineKeyboardMarkup(inline_keyboard=[fields[i : i + 2] for i in range(0, len(fields), 2)] + [[ok]])
+    rows = [fields[i : i + 2] for i in range(0, len(fields), 2)]
+    return InlineKeyboardMarkup(inline_keyboard=rows + [[delete], [ok]])
+
+
+def delete_confirm(lead_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=texts.DELETE_YES, callback_data=f"delete:yes:{lead_id}"),
+        InlineKeyboardButton(text=texts.DELETE_NO, callback_data=f"delete:no:{lead_id}"),
+    ]])
 
 
 def remove() -> ReplyKeyboardRemove:

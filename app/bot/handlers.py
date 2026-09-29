@@ -473,6 +473,42 @@ async def on_edit_text(message: Message, state: FSMContext, db: Database, settin
     await apply_edit(message, state, db, settings, lead_id, field, values)
 
 
+async def on_delete_button(cb: CallbackQuery, state: FSMContext, db: Database, settings: Settings) -> None:
+    """Удаление заявки: «delete:ask» — вопрос «Точно?», «delete:yes/no» — ответ (принимается только после вопроса)."""
+    _, action, raw_id = (cb.data.split(":") + ["", ""])[:3]
+    current = await state.get_state()
+    data = await state.get_data()
+    lead_id = data.get("lead_id")
+    await cb.answer()
+    allowed = {s.state for s in QUESTIONS} | {Lead.done.state} | EDIT_STATES
+    if (
+        not isinstance(cb.message, Message) or raw_id != str(lead_id) or current not in allowed
+        or action not in ("ask", "yes", "no")
+    ):
+        return  # старая кнопка, чужая заявка или подделанный callback
+    if action == "ask":
+        await cb.message.edit_text(f"{cb.message.text}\n\n✓ {texts.ORDER_DELETE}")
+        await state.update_data(delete_pending=lead_id)
+        await cb.message.answer(texts.DELETE_CONFIRM.format(lead_id=lead_id),
+                                reply_markup=keyboards.delete_confirm(lead_id))
+        return
+    if data.get("delete_pending") != lead_id:
+        return  # «Да, удалить» без показанного вопроса — не принимаем
+    await state.update_data(delete_pending=None)
+    await cb.message.edit_text(f"{cb.message.text}\n\n✓ {texts.DELETE_YES if action == 'yes' else texts.DELETE_NO}")
+    if action == "no":
+        await cb.message.answer(texts.DELETE_KEPT)
+        current = await leave_edit(state)
+        if question_state := next((s for s in QUESTIONS if s.state == current), None):
+            await ask(cb.message, db, lead_id, question_state)  # анкета не закончена — продолжаем её
+        return
+    # Полное удаление по просьбе клиента: данные, переписка, карточка; менеджеру — без личных данных.
+    await db.delete_lead_data(lead_id)
+    await state.clear()
+    log.info("Заявка %s удалена клиентом", lead_id)
+    await cb.message.answer(texts.DELETED.format(lead_id=lead_id), reply_markup=keyboards.remove())
+
+
 def edited_phone(item: Incoming) -> str | None:
     if item.kind == "contact":
         return normalize_phone(item.text) or clip(item.text)
@@ -716,6 +752,7 @@ def create_router() -> Router:
     r.callback_query.register(on_edit_choice, EditLead.area, F.data.startswith("area:"))
     r.callback_query.register(on_edit_choice, EditLead.ceiling_type, F.data.startswith("ct:"))
     r.callback_query.register(on_edit_button, F.data.startswith("edit:"))
+    r.callback_query.register(on_delete_button, F.data.startswith("delete:"))
     r.callback_query.register(on_stale_button)
 
     r.message.register(on_llm_answer, StateFilter(*QUESTIONS, Lead.done), TEXT_OR_VOICE)

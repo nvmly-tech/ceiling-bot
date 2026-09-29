@@ -16,7 +16,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPrevie
 
 from app.bot.assistant import LeadAssistant
 from app.config import Settings
-from app.db import TG_CLIENT_MSG, TG_DIGEST, TG_LEAD, TG_REMIND, Database, Lead, OutboxTask, now_iso
+from app.db import TG_CLIENT_MSG, TG_DELETED, TG_DIGEST, TG_LEAD, TG_REMIND, Database, Lead, OutboxTask, now_iso
 from app.parsing import clip
 from app.services.llm import LLMError
 from app.worktime import is_work_time
@@ -148,6 +148,7 @@ class Notifier:
             TG_REMIND: self.send_reminder,
             TG_CLIENT_MSG: self.send_client_messages,
             TG_DIGEST: self.send_digest,
+            TG_DELETED: self.send_deleted,
         }
 
     async def chat_id(self) -> int | None:
@@ -254,8 +255,18 @@ class Notifier:
         await self._send("\n".join(lines), markup)
         await self.db.update_lead(lead.id, client_msgs_notified=msgs[-1].id)
 
+    async def send_deleted(self, task: OutboxTask) -> None:
+        """Клиент удалил заявку. Личных данных в сообщении нет — их уже стёрли."""
+        await self._send(
+            f"🗑 <b>Заявка №{task.lead_id} удалена клиентом</b>\n"
+            "По его просьбе стёрты анкета, переписка и карточка в Trello."
+        )
+
     async def send_digest(self, task: OutboxTask) -> None:
-        leads = [lead for i in task.payload["lead_ids"] if (lead := await self.db.get_lead(i)) and not lead.taken_at]
+        leads = [
+            lead for i in task.payload["lead_ids"]
+            if (lead := await self.db.get_lead(i)) and not lead.taken_at and lead.status != "deleted"
+        ]
         if leads:
             await self._send(digest_text(leads), digest_keyboard(leads))
 
