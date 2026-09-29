@@ -120,3 +120,21 @@ async def test_manager_sees_edit_but_not_questionnaire_again(db):
     [msg] = [m for m in env.group() if "дописал" in m.text]
     assert "• ✏️ Время замера: в субботу → в воскресенье утром" in msg.text
     assert "/start" not in msg.text and "Квартира" not in msg.text  # анкету менеджер уже видел
+
+
+async def test_edit_phone_by_contact_and_time_by_voice(client: Client, db):
+    from app.db import STT_TRANSCRIBE
+
+    await complete_dialog(client)
+    await client.text("/order")
+    await client.press("edit:phone:1")
+    await client.contact("+7 912 000-00-00")
+    assert (await db.get_lead(1)).phone == "+79120000000"
+
+    await client.press("edit:measure_time:1")
+    await client.voice("voice-time")  # без Groq — расшифровка позже, в поле пока заглушка
+    assert (await db.get_lead(1)).measure_time == texts.VOICE_PLACEHOLDER
+    [task] = [t for t in await db.outbox_pending() if t.kind == STT_TRANSCRIBE]
+    assert task.payload["field"] == "measure_time"  # расшифровка ляжет именно в правленое поле
+    kinds = [m.kind for m in await db.get_messages(1)][-4:]
+    assert kinds == ["contact", "edit", "voice", "edit"]  # контакт и голос — в переписке (вложение, расшифровка)
