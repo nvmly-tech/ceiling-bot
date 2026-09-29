@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS leads (
     ceiling_type  TEXT,
     phone         TEXT,
     measure_time  TEXT,
-    status        TEXT NOT NULL DEFAULT 'new',   -- new | qualified | abandoned
+    status        TEXT NOT NULL DEFAULT 'new',   -- new | qualified | abandoned | cancelled (закрыта клиентом)
     is_night      INTEGER NOT NULL DEFAULT 0,
     trello_card_id TEXT,
     created_at    TEXT NOT NULL,
@@ -335,8 +335,8 @@ class Database:
         )
 
     async def leads_waiting(self) -> list[Lead]:
-        """Менеджер уведомлён, но лид никто не взял."""
-        return await self._leads("notified_at IS NOT NULL AND taken_at IS NULL")
+        """Менеджер уведомлён, но лид никто не взял (закрытые клиентом — не в счёт: о них не напоминаем)."""
+        return await self._leads("notified_at IS NOT NULL AND taken_at IS NULL AND status != 'cancelled'")
 
     # --- переписка ---
 

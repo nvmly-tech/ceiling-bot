@@ -37,5 +37,14 @@ def phone() -> ReplyKeyboardMarkup:
     )
 
 
+def restart(lead_id: int) -> InlineKeyboardMarkup:
+    """/start посреди анкеты: продолжить её или закрыть и начать новую. В callback — номер заявки,
+    чтобы старая кнопка (заявка уже сменилась) ничего не сделала."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=texts.RESTART_CONTINUE, callback_data=f"restart:continue:{lead_id}"),
+        InlineKeyboardButton(text=texts.RESTART_NEW, callback_data=f"restart:new:{lead_id}"),
+    ]])
+
+
 def remove() -> ReplyKeyboardRemove:
     return ReplyKeyboardRemove()

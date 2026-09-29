@@ -133,7 +133,7 @@ async def test_board_setup_creates_missing_lists_and_labels(db):
     assert [lst["name"] for lst in fake.lists_] == ["Новые запросы", "В работе"]
     assert {lbl["name"] for lbl in fake.labels_} == {name for name, _ in LABELS.values()}
     assert board.labels["night"] == "B0"  # существующая метка переиспользована
-    assert fake.calls.count("create_label") == 2
+    assert fake.calls.count("create_label") == len(LABELS) - 1  # все, кроме существующей «ночной»
 
 
 # --- синхронизация ---
@@ -267,3 +267,9 @@ async def test_outbox_takes_limited_tasks_per_queue(db):
     await db.enqueue(CARD_COMMENT, 2)
     tasks = await db.outbox_pending(per_queue=20)
     assert len(tasks) == 21 and tasks[-1].lead_id == 2
+
+
+def test_cancelled_lead_label_and_status():
+    from app.services.trello import LABELS, STATUS_NAMES
+
+    assert LABELS["cancelled"][0] == "закрыта клиентом" and "cancelled" in STATUS_NAMES

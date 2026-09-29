@@ -39,6 +39,7 @@ COMMENT_LIMIT = 16384  # лимит Trello на комментарий
 LABELS = {
     "qualified": ("квалифицирован", "green"),
     "abandoned": ("не завершил анкету", "orange"),
+    "cancelled": ("закрыта клиентом", "black"),
     "night": ("ночной", "purple"),
 }
 
@@ -140,7 +141,10 @@ def card_name(lead: Lead) -> str:
     return f"{icon}№{lead.id} · " + " · ".join(p for p in parts if p)
 
 
-STATUS_NAMES = {"new": "заполняет анкету", "qualified": "анкета заполнена", "abandoned": "не завершил анкету"}
+STATUS_NAMES = {
+    "new": "заполняет анкету", "qualified": "анкета заполнена", "abandoned": "не завершил анкету",
+    "cancelled": "закрыта клиентом — начал новую заявку",
+}
 
 
 def card_desc(lead: Lead, zone: ZoneInfo) -> str:
@@ -258,7 +262,7 @@ class TrelloSync:
 
     def label_ids(self, lead: Lead, board: Board) -> list[str]:
         keys = []
-        if lead.status in ("qualified", "abandoned"):
+        if lead.status in ("qualified", "abandoned", "cancelled"):
             keys.append(lead.status)
         if lead.is_night:
             keys.append("night")

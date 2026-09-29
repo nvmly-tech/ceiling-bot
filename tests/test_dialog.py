@@ -6,7 +6,8 @@ from aiogram import Bot
 from app.bot import texts
 from app.config import Settings
 from app.main import build_dispatcher
-from tests.conftest import USER, Client, FakeSession
+from tests.conftest import CHAT, USER, Client, FakeSession
+from tests.test_trello import complete_dialog
 
 
 async def test_full_flow_buttons(client: Client, db):
@@ -83,13 +84,12 @@ async def test_no_phone_button(client: Client, db):
     assert (await db.last_lead(USER.id)).phone == texts.NO_PHONE_VALUE
 
 
-async def test_restart_mid_dialog_continues(client: Client, db):
+async def test_restart_mid_dialog_does_not_create_lead_by_itself(client: Client, db):
     await client.text("/start")
     await client.press("obj:flat")
-    await client.text("/start")
-    assert client.last_text() == texts.Q_AREA
-    assert client.session.sent()[-2].text == texts.CONTINUE
-    assert (await db.last_lead(USER.id)).id == 1  # новый лид не создан
+    await client.text("/start")  # без выбора клиента новая заявка не заводится
+    assert client.last_text() == texts.RESTART_CHOICE.format(lead_id=1)
+    assert (await db.last_lead(USER.id)).id == 1
 
 
 async def test_after_done_ack_once_and_new_lead_on_start(client: Client, db):
@@ -170,3 +170,72 @@ def test_measure_time_from_rest(rest, expected):
     from app.bot.handlers import measure_time_from
 
     assert measure_time_from(rest) == expected
+
+
+# --- /start посреди анкеты: продолжить или начать новую ---
+
+
+async def start_and_answer_object(client: Client) -> None:
+    await client.text("/start")
+    await client.press("obj:flat")
+    await client.text("/start")
+
+
+async def test_restart_offers_continue_or_new(client: Client, db):
+    await start_and_answer_object(client)
+    last = client.session.sent(CHAT.id)[-1]
+    assert last.text == texts.RESTART_CHOICE.format(lead_id=1)
+    assert [b.callback_data for b in last.reply_markup.inline_keyboard[0]] == ["restart:continue:1", "restart:new:1"]
+
+
+async def test_restart_continue_keeps_questionnaire(client: Client, db):
+    await start_and_answer_object(client)
+    await client.press("restart:continue:1")
+    assert [m.text for m in client.session.sent(CHAT.id)[-2:]] == [texts.CONTINUE, texts.Q_AREA]
+    assert (await db.last_lead(USER.id)).id == 1
+
+
+async def test_restart_new_closes_previous_lead(client: Client, db):
+    await start_and_answer_object(client)
+    await client.press("restart:new:1")
+
+    old, new = await db.get_lead(1), await db.last_lead(USER.id)
+    assert old.status == "cancelled" and new.id == 2 and new.status == "new" and new.object is None
+    assert client.last_text() == texts.Q_OBJECT
+    sent = [m.text for m in client.session.sent(CHAT.id)]
+    assert texts.RESTART_CLOSED.format(lead_id=1) in sent
+    # Выбор клиента виден в переписке старой заявки (и в карточке Trello), новая начинается с него же.
+    assert texts.RESTART_NEW in [m.text for m in await db.get_messages(1) if m.kind == "button"]
+
+    await client.press("obj:house")  # ответы идут уже в новую заявку
+    assert (await db.get_lead(2)).object == texts.OBJECT_OPTIONS["house"] and (await db.get_lead(1)).object
+
+
+async def test_restart_new_respects_daily_limit(db):
+    settings = Settings(bot_token="123:TEST", work_start=time(0), work_end=time(23, 59, 59))
+    session = FakeSession()
+    client = Client(build_dispatcher(db, settings), Bot("123:TEST", session=session), session)
+    for _ in range(2):
+        await complete_dialog(client)
+    await start_and_answer_object(client)  # третья заявка за сутки — не закончена
+    await client.press("restart:new:3")
+    assert client.session.sent(CHAT.id)[-2].text == texts.RESTART_LIMIT.format(limit=3, lead_id=3)
+    assert client.last_text() == texts.Q_AREA
+    assert (await db.get_lead(3)).status == "new" and (await db.last_lead(USER.id)).id == 3
+
+
+async def test_stale_restart_button_is_ignored(client: Client, db):
+    await start_and_answer_object(client)
+    await client.press("restart:new:1")
+    await client.press("restart:new:1")  # повторное нажатие старой кнопки
+    await client.press("restart:new:abc")  # подделанный callback
+    assert (await db.last_lead(USER.id)).id == 2
+
+
+async def test_cancelled_lead_gets_no_reminders(db):
+    lead = await db.create_lead(tg_user_id=1, chat_id=1, name="А", username=None, is_night=False)
+    await db.update_lead(lead.id, status="abandoned", notified_status="abandoned",
+                         notified_at="2026-09-29T10:00:00+00:00")
+    assert [x.id for x in await db.leads_waiting()] == [lead.id]
+    await db.update_lead(lead.id, status="cancelled")
+    assert await db.leads_waiting() == [] and await db.leads_to_notify() == []

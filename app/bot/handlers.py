@@ -28,6 +28,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    User,
 )
 
 from app.bot import keyboards, texts
@@ -271,9 +272,10 @@ async def llm_turn(
 
 async def start_lead(
     message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming,
-    assistant: LeadAssistant | None = None,
+    assistant: LeadAssistant | None = None, *, user: User | None = None,
 ) -> int:
-    user = message.from_user
+    """Новая заявка. user — клиент, если message — не его сообщение (кнопка под сообщением бота)."""
+    user = user or message.from_user
     if await db.count_leads_since(user.id, datetime.now(UTC) - timedelta(days=1)) >= LEADS_PER_DAY:
         # Кто-то жмёт /start по кругу — не плодим карточки и уведомления, продолжаем последнюю заявку.
         last = await db.last_lead(user.id)
@@ -313,12 +315,42 @@ async def on_start(
     current = await state.get_state()
     lead_id = (await state.get_data()).get("lead_id")
     if lead_id and current in {s.state for s in QUESTIONS}:
-        # Анкета не закончена — продолжаем её, а не заводим новый лид.
+        # Анкета не закончена — спрашиваем: продолжить её или закрыть и начать новую.
         await log_in(db, lead_id, item)
-        await say(message, db, lead_id, texts.CONTINUE)
-        await ask(message, db, lead_id, next(s for s in QUESTIONS if s.state == current))
+        await say(message, db, lead_id, texts.RESTART_CHOICE.format(lead_id=lead_id), keyboards.restart(lead_id))
         return
     await start_lead(message, state, db, settings, item, assistant)
+
+
+async def on_restart_button(
+    cb: CallbackQuery, state: FSMContext, db: Database, settings: Settings, assistant: LeadAssistant | None = None,
+) -> None:
+    _, action, raw_id = (cb.data.split(":") + ["", ""])[:3]
+    current = await state.get_state()
+    lead_id = (await state.get_data()).get("lead_id")
+    label = {"continue": texts.RESTART_CONTINUE, "new": texts.RESTART_NEW}.get(action)
+    await cb.answer()
+    if (
+        label is None or not isinstance(cb.message, Message) or raw_id != str(lead_id)
+        or current not in {s.state for s in QUESTIONS}
+    ):
+        return  # старая кнопка (заявка уже сменилась или закончена) или подделанный callback
+    await cb.message.edit_text(f"{cb.message.text}\n\n✓ {label}")
+    await db.add_message(lead_id, direction="in", kind="button", text=label)
+    question = next(s for s in QUESTIONS if s.state == current)
+    if action == "continue":
+        await say(cb.message, db, lead_id, texts.CONTINUE)
+        await ask(cb.message, db, lead_id, question)
+        return
+    if await db.count_leads_since(cb.from_user.id, datetime.now(UTC) - timedelta(days=1)) >= LEADS_PER_DAY:
+        # Лимит заявок в сутки: старую не закрываем (иначе клиент остался бы без заявки), продолжаем её.
+        await say(cb.message, db, lead_id, texts.RESTART_LIMIT.format(limit=LEADS_PER_DAY, lead_id=lead_id))
+        await ask(cb.message, db, lead_id, question)
+        return
+    # Закрыта клиентом: менеджеру о ней не сообщаем и не напоминаем, в Trello — метка «закрыта клиентом».
+    await db.update_lead(lead_id, status="cancelled")
+    await say(cb.message, db, lead_id, texts.RESTART_CLOSED.format(lead_id=lead_id))
+    await start_lead(cb.message, state, db, settings, Incoming("button", label), assistant, user=cb.from_user)
 
 
 # --- ответы через LLM ---
@@ -522,6 +554,7 @@ def create_router() -> Router:
     r.callback_query.register(on_object_button, Lead.object, F.data.startswith("obj:"))
     r.callback_query.register(on_area_button, Lead.area, F.data.startswith("area:"))
     r.callback_query.register(on_ceiling_button, Lead.ceiling_type, F.data.startswith("ct:"))
+    r.callback_query.register(on_restart_button, F.data.startswith("restart:"))
     r.callback_query.register(on_stale_button)
 
     r.message.register(on_llm_answer, StateFilter(*QUESTIONS, Lead.done), TEXT_OR_VOICE)
