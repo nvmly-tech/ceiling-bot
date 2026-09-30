@@ -86,6 +86,8 @@ def lead_body(lead: Lead) -> str:
         lines.append(f"📱 {escape(lead.phone)}")
     if lead.measure_time:
         lines.append(f"🗓 Замер: {escape(lead.measure_time)}")
+    if lead.source:
+        lines.append(f"📣 Источник: {escape(lead.source)}")
     if lead.hotness:
         reason = f" — {escape(lead.hotness_reason)}" if lead.hotness_reason else ""
         lines.append(f"{HOT_ICONS.get(lead.hotness, '')} <b>{escape(lead.hotness)}</b>{reason}")

@@ -19,6 +19,7 @@ from app.worktime import is_work_time
 KV_LAST_REPORT = "last_report_week"  # понедельник недели, в которую отчёт уже отправлен (или бот впервые запущен)
 REPORT_DAYS_DEFAULT = 7
 REPORT_DAYS_MAX = 90
+NO_SOURCE = "без метки"  # заявка пришла не по размеченной ссылке
 LEADS = ("заявка", "заявки", "заявок")
 RATINGS = ("оценка", "оценки", "оценок")
 DAYS = ("день", "дня", "дней")
@@ -65,6 +66,10 @@ def _leads_section(leads: Sequence[Lead]) -> list[str]:
     })]
     if any(kinds.values()):
         lines.append("• " + _joined(kinds))
+    sources = Counter(lead.source or NO_SOURCE for lead in leads)
+    if set(sources) != {NO_SOURCE}:
+        ranked = sorted(sources.items(), key=lambda kv: (kv[0] == NO_SOURCE, -kv[1], kv[0]))  # «без метки» — в конце
+        lines.append("• источники: " + " · ".join(f"{escape(name)} {n}" for name, n in ranked))
     return lines
 
 

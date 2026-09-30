@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
-from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State
 from aiogram.types import (
@@ -60,6 +60,9 @@ MAX_VOICE_SEC = 300     # голосовые длиннее не расшифр�
 FLOOD_PER_MIN = 20
 FLOOD_PER_DAY = 300
 FLOOD_NOTICE_EVERY = timedelta(hours=1)  # предупреждение клиенту — не чаще
+
+# Метка источника из ссылки t.me/<бот>?start=<метка> — в том виде, в каком её допускает Telegram.
+_SOURCE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 FIELD_STATE = {
     "object": Lead.object,
@@ -279,11 +282,18 @@ async def llm_turn(
     return True
 
 
+def start_source(command: CommandObject | None) -> str | None:
+    """Источник заявки из /start <метка>. Всё, что не похоже на метку (её мог набрать и сам клиент), — не источник."""
+    arg = (command.args or "") if command else ""
+    return arg.lower() if _SOURCE.fullmatch(arg) else None
+
+
 async def start_lead(
     message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming,
-    assistant: LeadAssistant | None = None, *, user: User | None = None,
+    assistant: LeadAssistant | None = None, *, user: User | None = None, source: str | None = None,
 ) -> int:
-    """Новая заявка. user — клиент, если message — не его сообщение (кнопка под сообщением бота)."""
+    """Новая заявка. user — клиент, если message — не его сообщение (кнопка под сообщением бота);
+    source — метка источника из ссылки, по которой клиент пришёл."""
     user = user or message.from_user
     if await db.count_leads_since(user.id, datetime.now(UTC) - timedelta(days=1)) >= LEADS_PER_DAY:
         # Кто-то жмёт /start по кругу — не плодим карточки и уведомления, продолжаем последнюю заявку.
@@ -296,7 +306,8 @@ async def start_lead(
     now = local_now(settings.zone)
     night = not is_work_time(now, settings.work_start, settings.work_end)
     lead = await db.create_lead(
-        tg_user_id=user.id, chat_id=message.chat.id, name=user.full_name, username=user.username, is_night=night
+        tg_user_id=user.id, chat_id=message.chat.id, name=user.full_name, username=user.username, is_night=night,
+        source=source,
     )
     await state.set_state(Lead.object)
     await state.set_data({"lead_id": lead.id})
@@ -319,16 +330,18 @@ async def start_lead(
 
 async def on_start(
     message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming,
-    assistant: LeadAssistant | None = None,
+    assistant: LeadAssistant | None = None, command: CommandObject | None = None,
 ) -> None:
     current = await leave_edit(state)
     lead_id = (await state.get_data()).get("lead_id")
+    source = start_source(command)
     if lead_id and current in {s.state for s in QUESTIONS}:
         # Анкета не закончена — спрашиваем: продолжить её или закрыть и начать новую.
+        await state.update_data(start_source=source)  # метка достанется новой заявке, если клиент выберет её
         await log_in(db, lead_id, item)
         await say(message, db, lead_id, texts.RESTART_CHOICE.format(lead_id=lead_id), keyboards.restart(lead_id))
         return
-    await start_lead(message, state, db, settings, item, assistant)
+    await start_lead(message, state, db, settings, item, assistant, source=source)
 
 
 async def on_restart_button(
@@ -336,7 +349,8 @@ async def on_restart_button(
 ) -> None:
     _, action, raw_id = (cb.data.split(":") + ["", ""])[:3]
     current = await state.get_state()
-    lead_id = (await state.get_data()).get("lead_id")
+    data = await state.get_data()
+    lead_id = data.get("lead_id")
     label = {"continue": texts.RESTART_CONTINUE, "new": texts.RESTART_NEW}.get(action)
     await cb.answer()
     if (
@@ -359,7 +373,8 @@ async def on_restart_button(
     # Закрыта клиентом: менеджеру о ней не сообщаем и не напоминаем, в Trello — метка «закрыта клиентом».
     await db.update_lead(lead_id, status="cancelled")
     await say(cb.message, db, lead_id, texts.RESTART_CLOSED.format(lead_id=lead_id))
-    await start_lead(cb.message, state, db, settings, Incoming("button", label), assistant, user=cb.from_user)
+    await start_lead(cb.message, state, db, settings, Incoming("button", label), assistant, user=cb.from_user,
+                     source=data.get("start_source"))
 
 
 # --- /order: клиент смотрит и правит свою заявку ---

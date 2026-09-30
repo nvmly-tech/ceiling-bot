@@ -118,6 +118,7 @@ MIGRATIONS = [
     ("leads", "contact_answer", "TEXT"),           # yes | no
     ("leads", "rating_asked_at", "TEXT"),          # когда попросили оценить замер
     ("leads", "rating", "INTEGER"),                # оценка замера клиентом, 1–5
+    ("leads", "source", "TEXT"),                   # метка источника из ссылки t.me/<бот>?start=<метка>
 ]
 
 NUDGES_OFF = 1000  # «напоминания уже исчерпаны»: так помечены заявки, взятые до появления напоминаний
@@ -229,6 +230,7 @@ class Lead:
     contact_answer: str | None = None
     rating_asked_at: str | None = None
     rating: int | None = None
+    source: str | None = None
 
 
 @dataclass
@@ -312,13 +314,14 @@ class Database:
     # --- лиды ---
 
     async def create_lead(
-        self, *, tg_user_id: int, chat_id: int, name: str | None, username: str | None, is_night: bool
+        self, *, tg_user_id: int, chat_id: int, name: str | None, username: str | None, is_night: bool,
+        source: str | None = None,
     ) -> Lead:
         ts = now_iso()
         cur = await self.conn.execute(
-            "INSERT INTO leads (tg_user_id, chat_id, name, username, is_night, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (tg_user_id, chat_id, name, username, int(is_night), ts, ts),
+            "INSERT INTO leads (tg_user_id, chat_id, name, username, is_night, source, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (tg_user_id, chat_id, name, username, int(is_night), source, ts, ts),
         )
         await self._enqueue(CARD_CREATE, cur.lastrowid)
         await self._commit()

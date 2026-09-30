@@ -180,6 +180,7 @@ def card_desc(lead: Lead, zone: ZoneInfo) -> str:
         "",
         *summary_lines(lead),
         f"**Клиент в Telegram:** {contact} (ID {lead.tg_user_id})",
+        *([f"**Источник:** {md(lead.source)}"] if lead.source else []),
         f"**Создана:** {created:%d.%m.%Y %H:%M} ({zone.key})",
         "",
         "Переписка — в комментариях.",
