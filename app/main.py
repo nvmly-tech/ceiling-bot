@@ -9,12 +9,14 @@ from aiogram import Bot, Dispatcher
 from app import redact
 from app.bot.assistant import LeadAssistant
 from app.bot.facts import DEFAULT_FILE, StudioFacts
+from app.bot.followup import create_followup_router
 from app.bot.handlers import create_router
 from app.bot.manager import create_manager_router
 from app.bot.storage import SQLiteStorage
 from app.config import Settings, get_settings
 from app.db import Database
 from app.services import systemd
+from app.services.client_followup import ClientFollowUp
 from app.services.health import Alerter, HealthMonitor
 from app.services.llm import LLMProvider, LLMRouter
 from app.services.notifier import Notifier
@@ -45,6 +47,7 @@ def build_dispatcher(
     dp["stt"] = stt
     dp["assistant"] = assistant
     dp.include_router(create_manager_router())
+    dp.include_router(create_followup_router())  # до диалога: его обработчик ловит все остальные кнопки
     dp.include_router(create_router())
     return dp
 
@@ -154,7 +157,10 @@ async def build_app(settings: Settings, bot: Bot | None = None, db: Database | N
     assistant = LeadAssistant(llm, StudioFacts(settings.facts_path or DEFAULT_FILE)) if llm else None
     notifier = Notifier(bot, db, settings, trello_enabled=trello is not None, assistant=assistant)
 
+    clients = ClientFollowUp(bot, db, settings)
+    notifier.extra_scans.append(clients.scan)
     handlers = dict(trello.handlers) if trello else {}
+    handlers |= clients.handlers
     if stt:
         handlers |= stt.handlers
     if settings.manager_chat_id is None:

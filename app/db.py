@@ -12,6 +12,8 @@ from typing import Any
 
 import aiosqlite
 
+from app.stages import MEASURE
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS leads (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,6 +113,7 @@ MIGRATIONS = [
     ("leads", "nudges_sent", "INTEGER NOT NULL DEFAULT 0"),  # напоминаний о заявке без итога на текущем этапе
     ("leads", "last_nudge_at", "TEXT"),
     ("leads", "escalated_at", "TEXT"),             # когда сообщили владельцу (на текущем этапе)
+    ("leads", "measure_reminded_for", "TEXT"),     # measure_at, о котором клиенту уже напомнили накануне
 ]
 
 NUDGES_OFF = 1000  # «напоминания уже исчерпаны»: так помечены заявки, взятые до появления напоминаний
@@ -129,7 +132,7 @@ CARD_FIELDS = {
 LEAD_FIELDS = CARD_FIELDS | {
     "trello_card_id", "trello_card_url", "completed_at", "notified_status", "notified_at",
     "reminders_sent", "last_reminder_at", "client_msgs_notified", "summary_status", "stage_at", "stage_by_name",
-    "nudges_sent", "last_nudge_at", "escalated_at",
+    "nudges_sent", "last_nudge_at", "escalated_at", "measure_reminded_for",
 }
 
 # Задачи outbox. Префикс до точки — канал: у каждого лида своя очередь на канал.
@@ -151,9 +154,11 @@ TG_DELETED = "tg.deleted"          # клиент удалил заявку, о 
 TG_PANEL = "tg.panel"              # панель взятой заявки: кнопки этапов (замер, отказ, договор…)
 TG_NUDGE = "tg.nudge"              # напоминание менеджеру: взятая заявка без итога
 TG_ESCALATE = "tg.escalate"        # владельцу: заявку никто не взял / нет итога
+TG_VISIT = "tg.visit"              # менеджерам: клиент ответил о замере (жду / перенести / отменить)
+TG_TO_CLIENT = "tg.to_client"      # клиенту: замер назначен, напоминание накануне
 ALL_KINDS = (CARD_CREATE, CARD_UPDATE, CARD_COMMENT, CARD_TAKE, CARD_ATTACH, CARD_TRANSCRIPT, CARD_DELETE, CARD_STAGE,
              STT_TRANSCRIBE, STT_SHADOW, TG_LEAD, TG_REMIND, TG_CLIENT_MSG, TG_DIGEST, TG_DELETED, TG_PANEL, TG_NUDGE,
-             TG_ESCALATE)
+             TG_ESCALATE, TG_VISIT, TG_TO_CLIENT)
 
 Event = tuple[str, dict[str, Any]]
 
@@ -205,6 +210,7 @@ class Lead:
     nudges_sent: int = 0
     last_nudge_at: str | None = None
     escalated_at: str | None = None
+    measure_reminded_for: str | None = None
 
 
 @dataclass
@@ -370,7 +376,10 @@ class Database:
         # В задаче — всё для комментария: к её выполнению этап может смениться ещё раз.
         payload = {"stage": stage, "by": by_name, "reason": reason,
                    "measure_at": measure_at or (lead.measure_at if lead else None)}
-        return await self.update_lead(lead_id, events=[(CARD_STAGE, payload)], **fields)
+        events: list[Event] = [(CARD_STAGE, payload)]
+        if stage == MEASURE and measure_at:
+            events.append((TG_TO_CLIENT, {"what": "measure_set", "at": measure_at}))  # клиенту — когда замер
+        return await self.update_lead(lead_id, events=events, **fields)
 
     async def count_leads_since(self, tg_user_id: int, since: datetime) -> int:
         async with self.conn.execute(
@@ -425,6 +434,13 @@ class Database:
         return await self._leads(
             "taken_at IS NOT NULL AND status NOT IN ('cancelled', 'deleted')"
             " AND (stage IS NULL OR stage NOT IN ('contract', 'refused'))"
+        )
+
+    async def leads_to_remind_measure(self) -> list[Lead]:
+        """Назначенные замеры, о которых клиенту ещё не напоминали (перенесённый — напомнить заново)."""
+        return await self._leads(
+            "stage = 'measure' AND measure_at IS NOT NULL AND status NOT IN ('cancelled', 'deleted')"
+            " AND measure_reminded_for IS NOT measure_at"
         )
 
     async def delete_lead_data(self, lead_id: int) -> None:

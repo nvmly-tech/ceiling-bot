@@ -58,6 +58,11 @@ def stage_text(stage: str | None, measure_at: str | None, reason: str | None, zo
     return text
 
 
+def stamp(measure_at: str) -> str:
+    """Короткая метка времени замера для кнопок клиента: ответ на перенесённый замер не принимается."""
+    return datetime.fromisoformat(measure_at).strftime("%Y%m%d%H%M")
+
+
 def measure_hours(work_start: time, work_end: time) -> list[int]:
     """Часы, которые предлагаются для замера: рабочее время студии (конец 20:30 — последний час 20:00)."""
     last = work_end.hour + (1 if (work_end.minute or work_end.second) else 0)

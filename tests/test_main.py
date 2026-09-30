@@ -8,6 +8,7 @@ from aiogram import Bot
 from app import db as dbmod
 from app.bot import texts
 from app.config import Settings
+from app.db import TG_TO_CLIENT
 from app.main import build_app, build_llm
 from tests.conftest import Client, FakeSession, eventually
 
@@ -39,7 +40,7 @@ async def test_full_configuration_is_wired(db):
     assert app.llm.on_status_change is not None  # алерты сторожа о моделях подключены
 
     # У каждого вида задач очереди есть обработчик — иначе задачи молча копились бы вечно.
-    assert set(app.outbox.handlers) == ALL_KINDS and len(ALL_KINDS) == 18
+    assert set(app.outbox.handlers) == ALL_KINDS and len(ALL_KINDS) == 20
 
     # Сторож видит опрос Telegram через middleware сессии.
     assert app.monitor.polling_attempt is None
@@ -56,7 +57,8 @@ async def test_minimal_configuration(db, caplog):
     caplog.set_level(logging.WARNING)
     app, session = await make(db, bot_token="123:TEST")
     assert (app.trello, app.stt, app.llm) == (None, None, None)
-    assert app.outbox.handlers == {}  # задачи копятся до появления настроек
+    # Задачи Trello, расшифровки и уведомлений копятся до появления настроек; сообщениям клиенту настройки не нужны.
+    assert set(app.outbox.handlers) == {TG_TO_CLIENT}
     for part in ("Trello не настроен", "Расшифровка не настроена", "Ни одна LLM не настроена",
                  "MANAGER_CHAT_ID не задан"):
         assert part in caplog.text

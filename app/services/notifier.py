@@ -8,7 +8,7 @@
 import asyncio
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from html import escape, unescape
 from zoneinfo import ZoneInfo
@@ -28,6 +28,7 @@ from app.db import (
     TG_NUDGE,
     TG_PANEL,
     TG_REMIND,
+    TG_VISIT,
     Database,
     Lead,
     OutboxTask,
@@ -221,6 +222,22 @@ def escalation_text(lead: Lead, reason: str, at: datetime, zone: ZoneInfo) -> st
     return "\n".join(lines)
 
 
+VISIT_NOTES = {
+    "yes": "✅ {head} подтвердил(а) замер: {when}",
+    "move": "🔁 {head}{phone} просит перенести замер ({when})\n{who}, позвоните и выберите новое время 👇",
+    "cancel": "❌ {head}{phone} отменил(а) замер ({when})\n{who}, уточните, что случилось 👇",
+}
+
+
+def visit_text(lead: Lead, answer: str, measure_at: str, who: str, zone: ZoneInfo) -> str:
+    """Клиент ответил на сообщение о замере."""
+    return VISIT_NOTES[answer].format(
+        head=f"<b>№{lead.id}</b> · {escape(lead.name or 'Клиент')}",
+        phone=f" · {escape(lead.phone)}" if lead.phone else "",
+        when=when_text(_at(measure_at), zone), who=who,
+    )
+
+
 def nudge_due(lead: Lead, s: Settings) -> datetime | None:
     """Когда напомнить тому, кто взял заявку, что итога нет; None — не напоминаем."""
     if lead.nudges_sent >= STUCK_NUDGES_MAX:
@@ -277,6 +294,8 @@ class Notifier:
         self.scan_interval = scan_interval
         self.last_scan: datetime | None = None  # для сторожа
         self.assistant = assistant  # резюме лида от LLM; без него уведомления уходят без резюме
+        # Другие проверки по расписанию (сообщения клиенту): идут в том же цикле, что и scan().
+        self.extra_scans: list[Callable[[datetime], Awaitable[None]]] = []
 
     @property
     def handlers(self):
@@ -289,6 +308,7 @@ class Notifier:
             TG_PANEL: self.send_panel,
             TG_NUDGE: self.send_nudge,
             TG_ESCALATE: self.send_escalation,
+            TG_VISIT: self.send_visit,
         }
 
     async def switch_chat(self, old_id: int, new_id: int) -> None:
@@ -400,16 +420,30 @@ class Notifier:
         if not in_work_on(lead, task.payload["stage"]):
             return  # итог отметили, пока напоминание ждало очереди
         at, zone = _at(task.payload["at"]), self.settings.zone
+        await self._send_mentioning(lead, lambda who: nudge_text(lead, who, at, zone), stage_keyboard(lead), "nudge")
+
+    async def send_visit(self, task: OutboxTask) -> None:
+        """Клиент ответил о замере: подтвердил — просто сообщаем; перенести или отменить — тому, кто ведёт,
+        с кнопками этапов."""
+        lead = await self.db.get_lead(task.lead_id)
+        if lead is None or lead.status == "deleted":
+            return
+        answer, measure_at, zone = task.payload["answer"], task.payload["at"], self.settings.zone
+        markup = stage_keyboard(lead) if answer != "yes" and in_work_on(lead, lead.stage) else None
+        await self._send_mentioning(lead, lambda who: visit_text(lead, answer, measure_at, who, zone), markup, "visit")
+
+    async def _send_mentioning(
+        self, lead: Lead, make_text: Callable[[str], str], markup: InlineKeyboardMarkup | None, kind: str,
+    ) -> None:
+        """Сообщение с упоминанием того, кто ведёт заявку. Упоминание по id Telegram может не принять
+        (настройки приватности менеджера) — тогда отправляем с именем без ссылки."""
         try:
-            await self._send(nudge_text(lead, mention(lead), at, zone), stage_keyboard(lead), lead_ids=[lead.id],
-                             kind="nudge")
+            await self._send(make_text(mention(lead)), markup, lead_ids=[lead.id], kind=kind)
         except TelegramBadRequest as e:
-            if lead.taken_by_username:
+            if lead.taken_by_username or not lead.taken_by_id:
                 raise
-            # Упоминание по id Telegram может не принять (настройки приватности) — тогда просто по имени.
-            log.warning("Упоминание менеджера в напоминании о заявке %s не принято: %s", lead.id, e.message)
-            await self._send(nudge_text(lead, mention(lead, link=False), at, zone), stage_keyboard(lead),
-                             lead_ids=[lead.id], kind="nudge")
+            log.warning("Упоминание менеджера (заявка %s) не принято: %s — отправляю без ссылки", lead.id, e.message)
+            await self._send(make_text(mention(lead, link=False)), markup, lead_ids=[lead.id], kind=kind)
 
     async def send_escalation(self, task: OutboxTask) -> None:
         """Владельцу: заявку никто не взял или по взятой нет итога."""
@@ -426,6 +460,7 @@ class Notifier:
     async def send_client_messages(self, task: OutboxTask) -> None:
         lead = await self._lead(task)
         msgs = await self.db.get_messages(lead.id, after_id=lead.client_msgs_notified, direction="in")
+        msgs = [m for m in msgs if m.kind != "visit"]  # ответ о замере уже ушёл отдельным уведомлением
         if not msgs:
             return
         lines = [f"💬 <b>№{lead.id} · {escape(lead.name or 'Клиент')} дописал(а) после анкеты:</b>", ""]
@@ -536,6 +571,9 @@ class Notifier:
             night = [lead.id for lead in waiting if lead.is_night]
             if night:
                 await self.db.enqueue(TG_DIGEST, None, {"lead_ids": night})
+
+        for extra in self.extra_scans:
+            await extra(now)
 
     async def _follow_up(self, lead: Lead, now: datetime) -> None:
         """Взятая заявка без итога: пора ли напомнить менеджеру и сообщить владельцу."""

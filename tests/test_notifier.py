@@ -8,6 +8,7 @@ from aiogram import Bot
 from app.config import Settings
 from app.db import TG_DIGEST, TG_LEAD, TG_REMIND, Database
 from app.main import build_dispatcher
+from app.services.client_followup import ClientFollowUp
 from app.services.notifier import KV_CHAT_ID, Notifier, next_work_start
 from app.services.outbox import Outbox
 from tests.conftest import MANAGER, MANAGER2, MANAGER_CHAT, USER, Client, FakeSession
@@ -44,7 +45,9 @@ async def make_env(db: Database, *, trello: bool = True, **settings_kw) -> Env:
     bot = Bot("123:TEST", session=session)
     fake = FakeTrello() if trello else None
     notifier = Notifier(bot, db, settings, trello_enabled=trello)
-    handlers = {**(make_sync(db, fake).handlers if fake else {}), **notifier.handlers}
+    clients = ClientFollowUp(bot, db, settings)
+    notifier.extra_scans.append(clients.scan)
+    handlers = {**(make_sync(db, fake).handlers if fake else {}), **notifier.handlers, **clients.handlers}
     outbox = Outbox(db, handlers)
     client = Client(build_dispatcher(db, settings, notifier), bot, session)
     return Env(db, client, session, notifier, outbox, fake)
