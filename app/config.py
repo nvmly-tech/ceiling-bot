@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     trello_board_id: str | None = None
     trello_list_new: str = "Новые запросы"
     trello_list_in_work: str = "В работе"
+    # Списки для этапов после «Взял»: замер назначен (и «клиент думает»), договор, отказ.
+    trello_list_measure: str = "Замер"
+    trello_list_won: str = "Договор"
+    trello_list_lost: str = "Отказ"
 
     @property
     def trello_enabled(self) -> bool:

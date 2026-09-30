@@ -147,7 +147,7 @@ async def test_client_errors_do_not_leak_secrets():
 async def test_board_setup_creates_missing_lists_and_labels(db):
     fake = FakeTrello(lists=("Новые запросы",), labels=("ночной",))
     board = await make_sync(db, fake).board()
-    assert [lst["name"] for lst in fake.lists_] == ["Новые запросы", "В работе"]
+    assert [lst["name"] for lst in fake.lists_] == ["Новые запросы", "В работе", "Замер", "Договор", "Отказ"]
     assert {lbl["name"] for lbl in fake.labels_} == {name for name, _ in LABELS.values()}
     assert board.labels["night"] == "B0"  # существующая метка переиспользована
     assert fake.calls.count("create_label") == len(LABELS) - 1  # все, кроме существующей «ночной»

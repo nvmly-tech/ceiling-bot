@@ -1,4 +1,5 @@
-"""Уведомления менеджерам в Telegram: новый лид, брошенная анкета, напоминания, утренний дайджест.
+"""Уведомления менеджерам в Telegram: новый лид, брошенная анкета, напоминания, утренний дайджест,
+панель взятой заявки с кнопками этапов.
 
 Все отправки идут через outbox (ретраи, порядок). Решения «пора уведомить / напомнить» принимает
 планировщик scan() по состоянию базы, поэтому после рестарта ничего не теряется и не дублируется.
@@ -10,16 +11,29 @@ import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from html import escape, unescape
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramMigrateToChat
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message, ReplyParameters
 
 from app.bot.assistant import LeadAssistant
 from app.config import Settings
-from app.db import TG_CLIENT_MSG, TG_DELETED, TG_DIGEST, TG_LEAD, TG_REMIND, Database, Lead, OutboxTask, now_iso
+from app.db import (
+    TG_CLIENT_MSG,
+    TG_DELETED,
+    TG_DIGEST,
+    TG_LEAD,
+    TG_PANEL,
+    TG_REMIND,
+    Database,
+    Lead,
+    OutboxTask,
+    now_iso,
+)
 from app.parsing import clip
 from app.services.llm import LLMError
+from app.stages import CONTRACT, MEASURE, NEXT, NO_ANSWER, REFUSED, REOPEN, THINKING, stage_text
 from app.worktime import is_work_time
 
 log = logging.getLogger(__name__)
@@ -118,6 +132,41 @@ def digest_keyboard(leads: list[Lead]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[buttons[i : i + 3] for i in range(0, len(buttons), 3)])
 
 
+# Панель взятой заявки: кнопка → действие в callback «st:<заявка>:<действие>».
+# Замер и отказ открывают выбор даты / причины (app/bot/outcomes.py), остальное меняет этап сразу.
+STAGE_BUTTONS = {
+    MEASURE: ("📅 Замер назначен", "measure"),
+    NO_ANSWER: ("📵 Не дозвонился", "no_answer"),
+    REFUSED: ("❌ Отказ", "refuse"),
+    THINKING: ("🤔 Думает", "thinking"),
+    CONTRACT: ("✅ Договор", "contract"),
+    REOPEN: ("↩️ Вернуть в работу", "reopen"),
+}
+
+
+def stage_keyboard(lead: Lead) -> InlineKeyboardMarkup:
+    buttons = []
+    for stage in NEXT[lead.stage]:
+        label, action = STAGE_BUTTONS[stage]
+        if stage == MEASURE and lead.stage == MEASURE:
+            label = "📅 Перенести замер"
+        buttons.append(InlineKeyboardButton(text=label, callback_data=f"st:{lead.id}:{action}"))
+    return InlineKeyboardMarkup(inline_keyboard=[buttons[i : i + 2] for i in range(0, len(buttons), 2)])
+
+
+def panel_text(lead: Lead, zone: ZoneInfo) -> str:
+    """Панель заявки: кто клиент, кто ведёт, на каком этапе. Телефон — чтобы звонить прямо отсюда."""
+    who = escape(lead.name or "Клиент") + (f" · {escape(lead.phone)}" if lead.phone else "")
+    lines = [
+        f"📋 <b>№{lead.id}</b> · {who}",
+        f"Ведёт: <b>{escape(lead.taken_by_name or '—')}</b>",
+        f"Этап: {escape(stage_text(lead.stage, lead.measure_at, lead.refuse_reason, zone))}",
+    ]
+    if lead.stage is None:
+        lines.append("Отметьте итог, когда он будет 👇")
+    return "\n".join(lines)
+
+
 # --- время ---
 
 
@@ -152,6 +201,7 @@ class Notifier:
             TG_CLIENT_MSG: self.send_client_messages,
             TG_DIGEST: self.send_digest,
             TG_DELETED: self.send_deleted,
+            TG_PANEL: self.send_panel,
         }
 
     async def switch_chat(self, old_id: int, new_id: int) -> None:
@@ -172,9 +222,10 @@ class Notifier:
 
     async def _send(
         self, text: str, markup: InlineKeyboardMarkup | None = None, *, lead_ids: Sequence[int] = (), kind: str = "",
+        reply_to: int | None = None,
     ) -> Message:
         """Сообщение в группу менеджеров. lead_ids — о каких заявках: номер сообщения запоминаем, чтобы удалить
-        его, если клиент удалит заявку."""
+        его, если клиент удалит заявку. reply_to — ответом на это сообщение (если оно ещё есть)."""
         chat_id = await self.chat_id()
         if chat_id is None:
             raise NotReady("MANAGER_CHAT_ID не задан")
@@ -191,6 +242,8 @@ class Notifier:
             disable_notification=self._silent(),
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
+        if reply_to:
+            kwargs["reply_parameters"] = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True)
         try:
             sent = await self.bot.send_message(chat_id, **kwargs)
         except TelegramMigrateToChat as e:
@@ -243,6 +296,14 @@ class Notifier:
         waiting = datetime.now(UTC) - next_work_start(datetime.fromisoformat(lead.notified_at), self.settings)
         text = lead_text(lead, "remind", max(1, int(waiting.total_seconds() // 60)))
         await self._send(text, lead_keyboard(lead), lead_ids=[lead.id], kind="remind")
+
+    async def send_panel(self, task: OutboxTask) -> None:
+        """Панель взятой заявки — ответом на уведомление, под которым нажали «Взял»."""
+        lead = await self.db.get_lead(task.lead_id)
+        if lead is None or lead.status == "deleted" or not lead.taken_at:
+            return
+        await self._send(panel_text(lead, self.settings.zone), stage_keyboard(lead), lead_ids=[lead.id], kind="panel",
+                         reply_to=task.payload.get("reply_to"))
 
     async def send_client_messages(self, task: OutboxTask) -> None:
         lead = await self._lead(task)

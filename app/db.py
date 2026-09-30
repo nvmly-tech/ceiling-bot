@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS tg_messages (
     lead_id    INTEGER NOT NULL,
     chat_id    INTEGER NOT NULL,
     message_id INTEGER NOT NULL,
-    kind       TEXT NOT NULL,          -- lead | remind | client | digest (строка на каждую заявку) | manager
+    kind       TEXT NOT NULL,          -- lead | remind | client | digest (строка на каждую заявку) | manager | panel
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tg_messages_lead ON tg_messages(lead_id);
@@ -102,16 +102,22 @@ MIGRATIONS = [
     ("leads", "llm_calls", "INTEGER NOT NULL DEFAULT 0"),  # обращений к LLM по заявке (бюджет токенов)
     ("messages", "text_alt", "TEXT"),              # теневая расшифровка голосового другой моделью (для сравнения)
     ("messages", "text_alt_model", "TEXT"),
+    ("leads", "stage", "TEXT"),                    # этап после «Взял»: app/stages.py (NULL — итога ещё нет)
+    ("leads", "stage_at", "TEXT"),
+    ("leads", "stage_by_name", "TEXT"),            # кто из менеджеров отметил этап
+    ("leads", "measure_at", "TEXT"),               # на когда назначен замер (UTC)
+    ("leads", "refuse_reason", "TEXT"),            # код причины отказа (stages.REFUSE_REASONS)
 ]
 
 # Поля анкеты: их изменение обновляет карточку в Trello.
 CARD_FIELDS = {
     "name", "username", "object", "area_m2", "area_text", "ceiling_type",
     "phone", "measure_time", "status", "is_night", "summary", "hotness", "hotness_reason", "summary_model",
+    "stage", "measure_at", "refuse_reason",
 }
 LEAD_FIELDS = CARD_FIELDS | {
     "trello_card_id", "trello_card_url", "completed_at", "notified_status", "notified_at",
-    "reminders_sent", "last_reminder_at", "client_msgs_notified", "summary_status",
+    "reminders_sent", "last_reminder_at", "client_msgs_notified", "summary_status", "stage_at", "stage_by_name",
 }
 
 # Задачи outbox. Префикс до точки — канал: у каждого лида своя очередь на канал.
@@ -122,6 +128,7 @@ CARD_TAKE = "trello.card_take"
 CARD_ATTACH = "trello.attach"          # приложить файл сообщения (голосовое, фото, документ)
 CARD_TRANSCRIPT = "trello.transcript"  # комментарий с отложенной расшифровкой голосового
 CARD_DELETE = "trello.card_delete"     # клиент удалил заявку — удалить карточку
+CARD_STAGE = "trello.card_stage"       # менеджер отметил этап — карточку в нужный список и комментарий
 STT_TRANSCRIBE = "stt.transcribe"      # отложенная расшифровка голосового
 STT_SHADOW = "shadow.stt"              # теневая расшифровка другой моделью — только для сравнения, клиенту не видна
 TG_LEAD = "tg.lead"                # уведомление о новом / брошенном лиде
@@ -129,8 +136,9 @@ TG_REMIND = "tg.remind"            # напоминание: лид никто �
 TG_CLIENT_MSG = "tg.client_msg"    # клиент дописал после анкеты
 TG_DIGEST = "tg.digest"            # утренний дайджест ночных лидов
 TG_DELETED = "tg.deleted"          # клиент удалил заявку, о которой менеджер уже знал
-ALL_KINDS = (CARD_CREATE, CARD_UPDATE, CARD_COMMENT, CARD_TAKE, CARD_ATTACH, CARD_TRANSCRIPT, CARD_DELETE,
-             STT_TRANSCRIBE, STT_SHADOW, TG_LEAD, TG_REMIND, TG_CLIENT_MSG, TG_DIGEST, TG_DELETED)
+TG_PANEL = "tg.panel"              # панель взятой заявки: кнопки этапов (замер, отказ, договор…)
+ALL_KINDS = (CARD_CREATE, CARD_UPDATE, CARD_COMMENT, CARD_TAKE, CARD_ATTACH, CARD_TRANSCRIPT, CARD_DELETE, CARD_STAGE,
+             STT_TRANSCRIBE, STT_SHADOW, TG_LEAD, TG_REMIND, TG_CLIENT_MSG, TG_DIGEST, TG_DELETED, TG_PANEL)
 
 Event = tuple[str, dict[str, Any]]
 
@@ -173,6 +181,11 @@ class Lead:
     summary_model: str | None = None
     summary_status: str | None = None
     llm_calls: int = 0
+    stage: str | None = None
+    stage_at: str | None = None
+    stage_by_name: str | None = None
+    measure_at: str | None = None
+    refuse_reason: str | None = None
 
 
 @dataclass
@@ -301,8 +314,9 @@ class Database:
         assert lead is not None
         return lead
 
-    async def take_lead(self, lead_id: int, *, by_id: int, by_name: str) -> bool:
-        """Менеджер берёт лид. False — лид уже кто-то взял (два нажатия одновременно)."""
+    async def take_lead(self, lead_id: int, *, by_id: int, by_name: str, reply_to: int | None = None) -> bool:
+        """Менеджер берёт лид. False — лид уже кто-то взял (два нажатия одновременно).
+        reply_to — сообщение, под которым нажали «Взял»: панель заявки придёт ответом на него."""
         cur = await self.conn.execute(
             "UPDATE leads SET taken_by_id = ?, taken_by_name = ?, taken_at = ?, updated_at = ?"
             " WHERE id = ? AND taken_at IS NULL",
@@ -312,8 +326,25 @@ class Database:
             await self.conn.rollback()
             return False
         await self._enqueue(CARD_TAKE, lead_id, {"by": by_name})
+        await self._enqueue(TG_PANEL, lead_id, {"reply_to": reply_to})
         await self._commit()
         return True
+
+    async def set_stage(
+        self, lead_id: int, stage: str | None, *, by_name: str, measure_at: str | None = None,
+        reason: str | None = None,
+    ) -> Lead:
+        """Менеджер отметил этап. Дата замера сохраняется и после него (для истории и вопросов клиенту)."""
+        fields: dict[str, Any] = {
+            "stage": stage, "stage_at": now_iso(), "stage_by_name": by_name, "refuse_reason": reason,
+        }
+        if measure_at is not None:
+            fields["measure_at"] = measure_at
+        lead = await self.get_lead(lead_id)
+        # В задаче — всё для комментария: к её выполнению этап может смениться ещё раз.
+        payload = {"stage": stage, "by": by_name, "reason": reason,
+                   "measure_at": measure_at or (lead.measure_at if lead else None)}
+        return await self.update_lead(lead_id, events=[(CARD_STAGE, payload)], **fields)
 
     async def count_leads_since(self, tg_user_id: int, since: datetime) -> int:
         async with self.conn.execute(

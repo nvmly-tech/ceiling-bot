@@ -56,7 +56,7 @@ def build_trello(db: Database, settings: Settings, fetch_file: FetchFile | None 
     client = TrelloClient(settings.trello_api_key.get_secret_value(), settings.trello_token.get_secret_value())
     return TrelloSync(
         db, client, settings.trello_board_id, settings.zone, settings.trello_list_new, settings.trello_list_in_work,
-        fetch_file,
+        fetch_file, stage_lists=(settings.trello_list_measure, settings.trello_list_won, settings.trello_list_lost),
     )
 
 

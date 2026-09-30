@@ -1,14 +1,15 @@
 """Trello: клиент REST API, оформление карточки и выполнение задач outbox.
 
 Карточка создаётся на первом сообщении клиента. Каждое сообщение переписки — отдельный комментарий,
-анкета — в описании карточки и обновляется по мере ответов.
+анкета — в описании карточки и обновляется по мере ответов. После «Взял в работу» карточка едет по спискам
+вслед за этапами, которые отмечает менеджер (замер, договор, отказ).
 """
 
 import logging
 import mimetypes
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any
@@ -21,6 +22,7 @@ from app.db import (
     CARD_COMMENT,
     CARD_CREATE,
     CARD_DELETE,
+    CARD_STAGE,
     CARD_TAKE,
     CARD_TRANSCRIPT,
     CARD_UPDATE,
@@ -30,6 +32,7 @@ from app.db import (
     OutboxTask,
 )
 from app.services.tgfiles import FileTooLarge
+from app.stages import CONTRACT, MEASURE, NO_ANSWER, REFUSED, THINKING, stage_text
 
 log = logging.getLogger(__name__)
 
@@ -167,6 +170,7 @@ def card_desc(lead: Lead, zone: ZoneInfo) -> str:
     lines = [
         f"**Заявка №{lead.id}**" + (" · 🌙 ночная" if lead.is_night else ""),
         f"Статус: {STATUS_NAMES.get(lead.status, lead.status)}",
+        *stage_lines(lead, zone),
         "",
         f"**Объект:** {md(lead.object) or dash}",
         f"**Площадь:** {md(area) or dash}",
@@ -181,6 +185,14 @@ def card_desc(lead: Lead, zone: ZoneInfo) -> str:
         "Переписка — в комментариях.",
     ]
     return "\n".join(lines)
+
+
+def stage_lines(lead: Lead, zone: ZoneInfo) -> list[str]:
+    """Этап взятой заявки и кто её ведёт."""
+    if not lead.taken_at:
+        return []
+    stage = md(stage_text(lead.stage, lead.measure_at, lead.refuse_reason, zone))
+    return [f"**Этап:** {stage} · ведёт {md(lead.taken_by_name)}"]
 
 
 def summary_lines(lead: Lead) -> list[str]:
@@ -224,6 +236,7 @@ class Board:
     list_new: str
     list_in_work: str
     labels: dict[str, str]  # ключ из LABELS → id метки
+    stage_lists: dict[str | None, str] = field(default_factory=dict)  # этап → id списка
 
 
 class TrelloSync:
@@ -231,10 +244,11 @@ class TrelloSync:
 
     def __init__(
         self, db: Database, client: TrelloClient, board_id: str, zone: ZoneInfo, list_new: str, list_in_work: str,
-        fetch_file: FetchFile | None = None,
+        fetch_file: FetchFile | None = None, *, stage_lists: tuple[str, str, str] = ("Замер", "Договор", "Отказ"),
     ):
         self.db, self.client, self.board_id, self.zone = db, client, board_id, zone
-        self.list_names = (list_new, list_in_work)
+        # Новые, в работе, замер, договор, отказ.
+        self.list_names = (list_new, list_in_work, *stage_lists)
         self.fetch_file = fetch_file  # скачивание файлов из Telegram для вложений
         self._board: Board | None = None
 
@@ -248,6 +262,7 @@ class TrelloSync:
             CARD_ATTACH: self.attach_file,
             CARD_TRANSCRIPT: self.add_transcript,
             CARD_DELETE: self.delete_card,
+            CARD_STAGE: self.stage_card,
         }
 
     async def board(self) -> Board:
@@ -266,7 +281,10 @@ class TrelloSync:
                 log.info("Trello: создаю метку «%s»", name)
                 existing[name] = (await self.client.create_label(self.board_id, name, color))["id"]
             labels[key] = existing[name]
-        self._board = Board(lists[self.list_names[0]], lists[self.list_names[1]], labels)
+        new, in_work, measure, won, lost = (lists[name] for name in self.list_names)
+        stage_lists = {None: in_work, NO_ANSWER: in_work, MEASURE: measure, THINKING: measure, CONTRACT: won,
+                       REFUSED: lost}
+        self._board = Board(new, in_work, labels, stage_lists)
         return self._board
 
     def label_ids(self, lead: Lead, board: Board) -> list[str]:
@@ -326,8 +344,19 @@ class TrelloSync:
         lead = await self._lead(task)
         board = await self.board()
         card_id = await self._card_id(lead)
-        await self.client.update_card(card_id, idList=board.list_in_work)
+        await self.client.update_card(card_id, idList=board.list_in_work, desc=card_desc(lead, self.zone))
         await self.client.add_comment(card_id, f"✅ Взял в работу: **{md(task.payload['by'])}**")
+
+    async def stage_card(self, task: OutboxTask) -> None:
+        """Менеджер отметил этап: карточка — в список этапа, в переписке — кто и что отметил."""
+        lead = await self._lead(task)
+        board = await self.board()
+        card_id = await self._card_id(lead)
+        p = task.payload
+        stage = p["stage"]
+        text = stage_text(stage, p.get("measure_at"), p.get("reason"), self.zone) if stage else "↩️ Снова в работе"
+        await self.client.update_card(card_id, idList=board.stage_lists[stage])
+        await self.client.add_comment(card_id, f"{md(text)} — **{md(p['by'])}**")
 
     async def _message(self, task: OutboxTask) -> Message:
         msg = await self.db.get_message(task.payload["message_id"])

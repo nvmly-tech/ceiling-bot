@@ -16,6 +16,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
@@ -40,6 +41,7 @@ from app.db import Lead as LeadRow
 from app.parsing import clip, normalize_phone, parse_area, replace_phones
 from app.services.llm import LLMError
 from app.services.stt import SpeechService
+from app.stages import CONTRACT, MEASURE, REFUSED, when_text
 from app.worktime import is_work_time, local_now, manager_eta
 
 log = logging.getLogger(__name__)
@@ -367,16 +369,20 @@ FIELD_BY_EDIT = {s.state: field for field, s in EDITS.items()}
 EDIT_OPTIONS = {"object": texts.OBJECT_OPTIONS, "area": texts.AREA_OPTIONS, "ceiling_type": texts.CEILING_OPTIONS}
 
 
-def client_status(lead: LeadRow) -> str:
+def client_status(lead: LeadRow, zone: ZoneInfo) -> str:
+    if lead.stage == MEASURE and lead.measure_at:
+        return texts.ORDER_STATUS["measure"].format(when=when_text(datetime.fromisoformat(lead.measure_at), zone))
+    if lead.stage in (CONTRACT, REFUSED):
+        return texts.ORDER_STATUS[lead.stage]
     if lead.taken_at:
         return texts.ORDER_STATUS["taken"]
     return texts.ORDER_STATUS["sent" if lead.status == "qualified" else "filling"]
 
 
-def order_text(lead: LeadRow) -> str:
+def order_text(lead: LeadRow, zone: ZoneInfo) -> str:
     known = known_fields(lead)
     fields = "\n".join(f"{label}: {known[f] or texts.EMPTY_VALUE}" for f, label in texts.FIELD_LABELS.items())
-    return texts.ORDER_VIEW.format(lead_id=lead.id, status=client_status(lead), fields=fields)
+    return texts.ORDER_VIEW.format(lead_id=lead.id, status=client_status(lead, zone), fields=fields)
 
 
 def edit_keyboard(field: str) -> Markup:
@@ -394,7 +400,7 @@ async def leave_edit(state: FSMContext) -> str | None:
     return current
 
 
-async def on_order(message: Message, state: FSMContext, db: Database) -> None:
+async def on_order(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
     """Показать заявку с кнопками правки. Просмотр — не часть переписки: в базу и карточку не пишем."""
     await leave_edit(state)
     lead_id = (await state.get_data()).get("lead_id")
@@ -402,7 +408,7 @@ async def on_order(message: Message, state: FSMContext, db: Database) -> None:
     if lead is None:
         await message.answer(texts.ORDER_NONE)
         return
-    await message.answer(order_text(lead), reply_markup=keyboards.order(lead.id))
+    await message.answer(order_text(lead, settings.zone), reply_markup=keyboards.order(lead.id))
 
 
 async def on_edit_button(cb: CallbackQuery, state: FSMContext, db: Database) -> None:
@@ -543,7 +549,7 @@ async def apply_edit(
         await advance(message, state, db, settings, lead_id)  # следующий незаполненный вопрос
         return
     await state.set_state(Lead.done)
-    await message.answer(order_text(lead), reply_markup=keyboards.order(lead.id))
+    await message.answer(order_text(lead, settings.zone), reply_markup=keyboards.order(lead.id))
 
 
 # --- ответы через LLM ---

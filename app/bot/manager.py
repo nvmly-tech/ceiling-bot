@@ -1,4 +1,4 @@
-"""Чат менеджеров (и админа): кнопка «Взял в работу», команда /status."""
+"""Чат менеджеров (и админа): кнопка «Взял в работу», кнопки этапов заявки, команда /status."""
 
 from datetime import datetime
 from html import escape
@@ -8,6 +8,7 @@ from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, LinkPreviewOptions, Message
 
+from app.bot.outcomes import on_stage_button
 from app.config import Settings
 from app.db import Database
 from app.parsing import replace_phones
@@ -47,7 +48,7 @@ async def on_take(cb: CallbackQuery, db: Database, settings: Settings, notifier:
         await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
         return
     by = cb.from_user.full_name
-    if await db.take_lead(lead_id, by_id=cb.from_user.id, by_name=by):
+    if await db.take_lead(lead_id, by_id=cb.from_user.id, by_name=by, reply_to=cb.message.message_id):
         await cb.answer(f"Заявка №{lead_id} ваша 👍")
         when = datetime.now(settings.zone).strftime("%H:%M")
         mark = f"\n\n✅ №{lead_id} взял(а): <b>{escape(by)}</b> · {when}"
@@ -97,6 +98,7 @@ def create_manager_router() -> Router:
     r = Router(name="manager")
     r.message.register(on_migrate, F.migrate_to_chat_id)
     r.callback_query.register(on_take, F.data.startswith("take:"))
+    r.callback_query.register(on_stage_button, F.data.startswith("st:"))
     r.message.register(on_status, Command("status"))
     r.message.register(on_group_message, F.chat.type.in_({"group", "supergroup"}))
     return r
