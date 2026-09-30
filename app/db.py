@@ -107,7 +107,18 @@ MIGRATIONS = [
     ("leads", "stage_by_name", "TEXT"),            # кто из менеджеров отметил этап
     ("leads", "measure_at", "TEXT"),               # на когда назначен замер (UTC)
     ("leads", "refuse_reason", "TEXT"),            # код причины отказа (stages.REFUSE_REASONS)
+    ("leads", "taken_by_username", "TEXT"),        # @username взявшего — упомянуть в напоминании
+    ("leads", "nudges_sent", "INTEGER NOT NULL DEFAULT 0"),  # напоминаний о заявке без итога на текущем этапе
+    ("leads", "last_nudge_at", "TEXT"),
+    ("leads", "escalated_at", "TEXT"),             # когда сообщили владельцу (на текущем этапе)
 ]
+
+NUDGES_OFF = 1000  # «напоминания уже исчерпаны»: так помечены заявки, взятые до появления напоминаний
+# Выполняется один раз — когда колонка появляется в существующей базе. Без этого после обновления бота
+# все давно взятые заявки разом получили бы напоминания и эскалации владельцу.
+BACKFILL = {
+    ("leads", "escalated_at"): f"UPDATE leads SET escalated_at = created_at, nudges_sent = {NUDGES_OFF}",
+}
 
 # Поля анкеты: их изменение обновляет карточку в Trello.
 CARD_FIELDS = {
@@ -118,6 +129,7 @@ CARD_FIELDS = {
 LEAD_FIELDS = CARD_FIELDS | {
     "trello_card_id", "trello_card_url", "completed_at", "notified_status", "notified_at",
     "reminders_sent", "last_reminder_at", "client_msgs_notified", "summary_status", "stage_at", "stage_by_name",
+    "nudges_sent", "last_nudge_at", "escalated_at",
 }
 
 # Задачи outbox. Префикс до точки — канал: у каждого лида своя очередь на канал.
@@ -137,8 +149,11 @@ TG_CLIENT_MSG = "tg.client_msg"    # клиент дописал после ан
 TG_DIGEST = "tg.digest"            # утренний дайджест ночных лидов
 TG_DELETED = "tg.deleted"          # клиент удалил заявку, о которой менеджер уже знал
 TG_PANEL = "tg.panel"              # панель взятой заявки: кнопки этапов (замер, отказ, договор…)
+TG_NUDGE = "tg.nudge"              # напоминание менеджеру: взятая заявка без итога
+TG_ESCALATE = "tg.escalate"        # владельцу: заявку никто не взял / нет итога
 ALL_KINDS = (CARD_CREATE, CARD_UPDATE, CARD_COMMENT, CARD_TAKE, CARD_ATTACH, CARD_TRANSCRIPT, CARD_DELETE, CARD_STAGE,
-             STT_TRANSCRIBE, STT_SHADOW, TG_LEAD, TG_REMIND, TG_CLIENT_MSG, TG_DIGEST, TG_DELETED, TG_PANEL)
+             STT_TRANSCRIBE, STT_SHADOW, TG_LEAD, TG_REMIND, TG_CLIENT_MSG, TG_DIGEST, TG_DELETED, TG_PANEL, TG_NUDGE,
+             TG_ESCALATE)
 
 Event = tuple[str, dict[str, Any]]
 
@@ -186,6 +201,10 @@ class Lead:
     stage_by_name: str | None = None
     measure_at: str | None = None
     refuse_reason: str | None = None
+    taken_by_username: str | None = None
+    nudges_sent: int = 0
+    last_nudge_at: str | None = None
+    escalated_at: str | None = None
 
 
 @dataclass
@@ -254,6 +273,8 @@ class Database:
                 columns = {row["name"] for row in await cur.fetchall()}
             if column not in columns:
                 await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                if backfill := BACKFILL.get((table, column)):
+                    await self.conn.execute(backfill)
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -314,13 +335,16 @@ class Database:
         assert lead is not None
         return lead
 
-    async def take_lead(self, lead_id: int, *, by_id: int, by_name: str, reply_to: int | None = None) -> bool:
+    async def take_lead(
+        self, lead_id: int, *, by_id: int, by_name: str, by_username: str | None = None, reply_to: int | None = None,
+    ) -> bool:
         """Менеджер берёт лид. False — лид уже кто-то взял (два нажатия одновременно).
-        reply_to — сообщение, под которым нажали «Взял»: панель заявки придёт ответом на него."""
+        reply_to — сообщение, под которым нажали «Взял»: панель заявки придёт ответом на него.
+        Счётчики напоминаний обнуляются: владельцу могли сообщить, что заявку никто не берёт, — теперь новый отсчёт."""
         cur = await self.conn.execute(
-            "UPDATE leads SET taken_by_id = ?, taken_by_name = ?, taken_at = ?, updated_at = ?"
-            " WHERE id = ? AND taken_at IS NULL",
-            (by_id, by_name, now_iso(), now_iso(), lead_id),
+            "UPDATE leads SET taken_by_id = ?, taken_by_name = ?, taken_by_username = ?, taken_at = ?, updated_at = ?,"
+            " nudges_sent = 0, last_nudge_at = NULL, escalated_at = NULL WHERE id = ? AND taken_at IS NULL",
+            (by_id, by_name, by_username, now_iso(), now_iso(), lead_id),
         )
         if cur.rowcount == 0:
             await self.conn.rollback()
@@ -337,6 +361,8 @@ class Database:
         """Менеджер отметил этап. Дата замера сохраняется и после него (для истории и вопросов клиенту)."""
         fields: dict[str, Any] = {
             "stage": stage, "stage_at": now_iso(), "stage_by_name": by_name, "refuse_reason": reason,
+            # Новый этап — новый отсчёт напоминаний и эскалации.
+            "nudges_sent": 0, "last_nudge_at": None, "escalated_at": None,
         }
         if measure_at is not None:
             fields["measure_at"] = measure_at
@@ -392,6 +418,13 @@ class Database:
         """Менеджер уведомлён, но лид никто не взял (закрытые клиентом — не в счёт: о них не напоминаем)."""
         return await self._leads(
             "notified_at IS NOT NULL AND taken_at IS NULL AND status NOT IN ('cancelled', 'deleted')"
+        )
+
+    async def leads_in_work(self) -> list[Lead]:
+        """Взятые заявки без итога (договор или отказ): о них напоминаем менеджеру."""
+        return await self._leads(
+            "taken_at IS NOT NULL AND status NOT IN ('cancelled', 'deleted')"
+            " AND (stage IS NULL OR stage NOT IN ('contract', 'refused'))"
         )
 
     async def delete_lead_data(self, lead_id: int) -> None:

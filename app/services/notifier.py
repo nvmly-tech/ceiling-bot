@@ -1,5 +1,5 @@
 """Уведомления менеджерам в Telegram: новый лид, брошенная анкета, напоминания, утренний дайджест,
-панель взятой заявки с кнопками этапов.
+панель взятой заявки с кнопками этапов, напоминания о взятых заявках без итога и эскалации владельцу.
 
 Все отправки идут через outbox (ретраи, порядок). Решения «пора уведомить / напомнить» принимает
 планировщик scan() по состоянию базы, поэтому после рестарта ничего не теряется и не дублируется.
@@ -23,7 +23,9 @@ from app.db import (
     TG_CLIENT_MSG,
     TG_DELETED,
     TG_DIGEST,
+    TG_ESCALATE,
     TG_LEAD,
+    TG_NUDGE,
     TG_PANEL,
     TG_REMIND,
     Database,
@@ -33,7 +35,7 @@ from app.db import (
 )
 from app.parsing import clip
 from app.services.llm import LLMError
-from app.stages import CONTRACT, MEASURE, NEXT, NO_ANSWER, REFUSED, REOPEN, THINKING, stage_text
+from app.stages import CONTRACT, MEASURE, NEXT, NO_ANSWER, REFUSED, REOPEN, THINKING, stage_text, when_text
 from app.worktime import is_work_time
 
 log = logging.getLogger(__name__)
@@ -49,6 +51,7 @@ CLIENT_TOTAL_MAX = 3000             # и всех строк вместе
 SUMMARY_BUDGET = 8                  # с
 # Telegram даёт боту удалять свои сообщения только 48 ч; берём с запасом — удаление идёт через очередь.
 TG_DELETE_WINDOW = timedelta(hours=47)
+STUCK_NUDGES_MAX = 2                # напоминаний менеджеру о заявке без итога — на каждый этап
 
 
 class NotReady(Exception):
@@ -167,6 +170,88 @@ def panel_text(lead: Lead, zone: ZoneInfo) -> str:
     return "\n".join(lines)
 
 
+# --- заявки без итога ---
+
+
+def _at(ts: str) -> datetime:
+    return datetime.fromisoformat(ts)
+
+
+def span(delta: timedelta) -> str:
+    minutes = max(1, int(delta.total_seconds() // 60))
+    if minutes < 60:
+        return f"{minutes} мин"
+    if minutes < 48 * 60:
+        return f"{minutes // 60} ч"
+    return f"{minutes // (24 * 60)} дн."
+
+
+def mention(lead: Lead, *, link: bool = True) -> str:
+    """Кто ведёт заявку — с упоминанием, чтобы напоминание пришло ему лично."""
+    if lead.taken_by_username:
+        return f"@{escape(lead.taken_by_username)}"
+    name = escape(lead.taken_by_name or "менеджер")
+    return f'<a href="tg://user?id={lead.taken_by_id}">{name}</a>' if link and lead.taken_by_id else name
+
+
+def nudge_text(lead: Lead, who: str, at: datetime, zone: ZoneInfo) -> str:
+    head = f"<b>№{lead.id}</b> · {escape(lead.name or 'Клиент')}"
+    phone = f" · {escape(lead.phone)}" if lead.phone else ""
+    since = span(at - _at(lead.stage_at or lead.taken_at))
+    if lead.stage == NO_ANSWER:
+        return f"📵 {head}{phone} — не дозвонились {since} назад\n{who}, попробуйте ещё раз 👇"
+    if lead.stage == MEASURE:
+        return f"📅 {head}{phone} — замер был {when_text(_at(lead.measure_at), zone)}\n{who}, чем закончился? 👇"
+    if lead.stage == THINKING:
+        return f"🤔 {head}{phone} — клиент думает {since}\n{who}, может, позвонить? 👇"
+    return f"⏳ {head} — в работе {since} без итога\n{who}, отметьте, чем закончилось 👇"
+
+
+def escalation_text(lead: Lead, reason: str, at: datetime, zone: ZoneInfo) -> str:
+    head = f"⚠️ <b>Заявка №{lead.id}</b> · {escape(lead.name or 'Клиент')}"
+    if reason == "untaken":
+        lines = [f"{head} — никто не взял за {span(at - _at(lead.notified_at))}"]
+    else:
+        base = lead.measure_at if lead.stage == MEASURE else lead.stage_at or lead.taken_at
+        stage = escape(stage_text(lead.stage, lead.measure_at, lead.refuse_reason, zone))
+        lines = [f"{head} — {stage}, без итога {span(at - _at(base))}",
+                 f"Ведёт: <b>{escape(lead.taken_by_name or '—')}</b>"]
+    if lead.trello_card_url:
+        lines.append(f'📋 <a href="{escape(lead.trello_card_url)}">Карточка в Trello</a>')
+    return "\n".join(lines)
+
+
+def nudge_due(lead: Lead, s: Settings) -> datetime | None:
+    """Когда напомнить тому, кто взял заявку, что итога нет; None — не напоминаем."""
+    if lead.nudges_sent >= STUCK_NUDGES_MAX:
+        return None
+    every = timedelta(days=s.thinking_remind_days) if lead.stage == THINKING else timedelta(minutes=s.stuck_after_min)
+    if lead.last_nudge_at:
+        return next_work_start(_at(lead.last_nudge_at), s) + every
+    if lead.stage == MEASURE:
+        # Первый раз — когда замер уже прошёл: спросить, чем закончился.
+        if not lead.measure_at:
+            return None
+        return next_work_start(_at(lead.measure_at) + timedelta(minutes=s.measure_result_after_min), s)
+    return next_work_start(_at(lead.stage_at or lead.taken_at), s) + every
+
+
+def escalate_due(lead: Lead, s: Settings) -> datetime | None:
+    """Когда сообщить владельцу, что итога нет; «клиент думает» — не повод."""
+    if lead.escalated_at or lead.stage == THINKING:
+        return None
+    base = lead.measure_at if lead.stage == MEASURE else lead.stage_at or lead.taken_at
+    return _at(base) + timedelta(hours=s.escalate_after_hours) if base else None
+
+
+def in_work_on(lead: Lead | None, stage: str | None) -> bool:
+    """Заявка всё ещё взята и на том же этапе, что при постановке задачи (иначе напоминание устарело)."""
+    return (
+        lead is not None and lead.status not in ("cancelled", "deleted") and bool(lead.taken_at)
+        and lead.stage == stage and stage not in (CONTRACT, REFUSED)
+    )
+
+
 # --- время ---
 
 
@@ -202,6 +287,8 @@ class Notifier:
             TG_DIGEST: self.send_digest,
             TG_DELETED: self.send_deleted,
             TG_PANEL: self.send_panel,
+            TG_NUDGE: self.send_nudge,
+            TG_ESCALATE: self.send_escalation,
         }
 
     async def switch_chat(self, old_id: int, new_id: int) -> None:
@@ -222,11 +309,11 @@ class Notifier:
 
     async def _send(
         self, text: str, markup: InlineKeyboardMarkup | None = None, *, lead_ids: Sequence[int] = (), kind: str = "",
-        reply_to: int | None = None,
+        reply_to: int | None = None, to: int | None = None,
     ) -> Message:
-        """Сообщение в группу менеджеров. lead_ids — о каких заявках: номер сообщения запоминаем, чтобы удалить
-        его, если клиент удалит заявку. reply_to — ответом на это сообщение (если оно ещё есть)."""
-        chat_id = await self.chat_id()
+        """Сообщение в группу менеджеров (или в чат to). lead_ids — о каких заявках: номер сообщения запоминаем,
+        чтобы удалить его, если клиент удалит заявку. reply_to — ответом на это сообщение (если оно ещё есть)."""
+        chat_id = to or await self.chat_id()
         if chat_id is None:
             raise NotReady("MANAGER_CHAT_ID не задан")
         parse_mode: str | None = "HTML"
@@ -247,10 +334,12 @@ class Notifier:
         try:
             sent = await self.bot.send_message(chat_id, **kwargs)
         except TelegramMigrateToChat as e:
-            # Группу превратили в супергруппу — у неё новый id. Запоминаем и шлём туда.
+            # Группу превратили в супергруппу — у неё новый id. Группу менеджеров запоминаем; шлём в новую.
             new_id = e.migrate_to_chat_id
-            await self.db.kv_set(KV_CHAT_ID, str(new_id))
-            log.error("Чат менеджеров сменил id: %s → %s. Обновите MANAGER_CHAT_ID в env-файле.", chat_id, new_id)
+            if to is None:
+                await self.db.kv_set(KV_CHAT_ID, str(new_id))
+            setting = "OWNER_CHAT_ID" if to else "MANAGER_CHAT_ID"
+            log.error("Чат сменил id: %s → %s. Обновите %s в env-файле.", chat_id, new_id, setting)
             sent = await self.bot.send_message(new_id, **kwargs)
         if lead_ids:
             await self.db.add_tg_message(lead_ids, sent.chat.id, sent.message_id, kind)
@@ -304,6 +393,35 @@ class Notifier:
             return
         await self._send(panel_text(lead, self.settings.zone), stage_keyboard(lead), lead_ids=[lead.id], kind="panel",
                          reply_to=task.payload.get("reply_to"))
+
+    async def send_nudge(self, task: OutboxTask) -> None:
+        """Напоминание тому, кто взял заявку: итога нет. С кнопками этапов — отметить можно прямо здесь."""
+        lead = await self.db.get_lead(task.lead_id)
+        if not in_work_on(lead, task.payload["stage"]):
+            return  # итог отметили, пока напоминание ждало очереди
+        at, zone = _at(task.payload["at"]), self.settings.zone
+        try:
+            await self._send(nudge_text(lead, mention(lead), at, zone), stage_keyboard(lead), lead_ids=[lead.id],
+                             kind="nudge")
+        except TelegramBadRequest as e:
+            if lead.taken_by_username:
+                raise
+            # Упоминание по id Telegram может не принять (настройки приватности) — тогда просто по имени.
+            log.warning("Упоминание менеджера в напоминании о заявке %s не принято: %s", lead.id, e.message)
+            await self._send(nudge_text(lead, mention(lead, link=False), at, zone), stage_keyboard(lead),
+                             lead_ids=[lead.id], kind="nudge")
+
+    async def send_escalation(self, task: OutboxTask) -> None:
+        """Владельцу: заявку никто не взял или по взятой нет итога."""
+        lead = await self.db.get_lead(task.lead_id)
+        reason = task.payload["reason"]
+        if reason == "untaken":
+            if lead is None or lead.taken_at or lead.status in ("cancelled", "deleted"):
+                return
+        elif not in_work_on(lead, task.payload["stage"]):
+            return
+        text = escalation_text(lead, reason, _at(task.payload["at"]), self.settings.zone)
+        await self._send(text, lead_ids=[lead.id], kind="escalation", to=self.settings.owner_chat_id)
 
     async def send_client_messages(self, task: OutboxTask) -> None:
         lead = await self._lead(task)
@@ -406,12 +524,38 @@ class Notifier:
                     events=[(TG_REMIND, {})],
                 )
 
+        if work_now:
+            for lead in await self.db.leads_in_work():
+                await self._follow_up(lead, now)
+            for lead in waiting:
+                await self._escalate_untaken(lead, now)
+
         today = now.astimezone(s.zone).date().isoformat()
         if work_now and await self.db.kv_get(KV_LAST_DIGEST) != today:
             await self.db.kv_set(KV_LAST_DIGEST, today)
             night = [lead.id for lead in waiting if lead.is_night]
             if night:
                 await self.db.enqueue(TG_DIGEST, None, {"lead_ids": night})
+
+    async def _follow_up(self, lead: Lead, now: datetime) -> None:
+        """Взятая заявка без итога: пора ли напомнить менеджеру и сообщить владельцу."""
+        payload = {"stage": lead.stage, "at": now_iso(now)}
+        if (due := nudge_due(lead, self.settings)) and now >= due:
+            await self.db.update_lead(lead.id, nudges_sent=lead.nudges_sent + 1, last_nudge_at=now_iso(now),
+                                      events=[(TG_NUDGE, payload)])
+        if (due := escalate_due(lead, self.settings)) and now >= due:
+            await self.db.update_lead(lead.id, escalated_at=now_iso(now),
+                                      events=[(TG_ESCALATE, {**payload, "reason": "stuck"})])
+
+    async def _escalate_untaken(self, lead: Lead, now: datetime) -> None:
+        """Все напоминания о новой заявке ушли, а её так никто и не взял — сообщить владельцу."""
+        s = self.settings
+        if lead.escalated_at or lead.reminders_sent < s.remind_max:
+            return
+        last = _at(lead.last_reminder_at or lead.notified_at)
+        if now >= next_work_start(last, s) + timedelta(minutes=s.remind_after_min):
+            await self.db.update_lead(lead.id, escalated_at=now_iso(now),
+                                      events=[(TG_ESCALATE, {"stage": None, "at": now_iso(now), "reason": "untaken"})])
 
     async def run(self) -> None:
         while True:

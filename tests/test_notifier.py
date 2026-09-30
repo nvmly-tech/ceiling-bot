@@ -180,8 +180,8 @@ async def test_reminders_every_interval_up_to_max(env: Env):
     await env.tick(t0)
     for minutes in (14, 16, 20, 31, 46, 61, 90):
         await env.tick(t0 + timedelta(minutes=minutes))
-    reminders = [m for m in env.group() if "никто не взял" in m.text]
-    assert len(reminders) == 3  # на 16, 31 и 46 минуте, дальше — лимит
+    reminders = [m for m in env.group() if m.text.startswith("⏰")]
+    assert len(reminders) == 3  # на 16, 31 и 46 минуте, дальше — лимит (на 61-й — уже сообщение владельцу)
     assert reminders[0].reply_markup.inline_keyboard[0][0].callback_data == "take:1"
 
 

@@ -48,7 +48,9 @@ async def on_take(cb: CallbackQuery, db: Database, settings: Settings, notifier:
         await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
         return
     by = cb.from_user.full_name
-    if await db.take_lead(lead_id, by_id=cb.from_user.id, by_name=by, reply_to=cb.message.message_id):
+    taken = await db.take_lead(lead_id, by_id=cb.from_user.id, by_name=by, by_username=cb.from_user.username,
+                               reply_to=cb.message.message_id)
+    if taken:
         await cb.answer(f"Заявка №{lead_id} ваша 👍")
         when = datetime.now(settings.zone).strftime("%H:%M")
         mark = f"\n\n✅ №{lead_id} взял(а): <b>{escape(by)}</b> · {when}"

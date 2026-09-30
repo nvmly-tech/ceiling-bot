@@ -39,7 +39,7 @@ async def test_full_configuration_is_wired(db):
     assert app.llm.on_status_change is not None  # алерты сторожа о моделях подключены
 
     # У каждого вида задач очереди есть обработчик — иначе задачи молча копились бы вечно.
-    assert set(app.outbox.handlers) == ALL_KINDS and len(ALL_KINDS) == 16
+    assert set(app.outbox.handlers) == ALL_KINDS and len(ALL_KINDS) == 18
 
     # Сторож видит опрос Telegram через middleware сессии.
     assert app.monitor.polling_attempt is None
