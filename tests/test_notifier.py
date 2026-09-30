@@ -11,6 +11,7 @@ from app.main import build_dispatcher
 from app.services.client_followup import ClientFollowUp
 from app.services.notifier import KV_CHAT_ID, Notifier, next_work_start
 from app.services.outbox import Outbox
+from app.services.report import Reports
 from tests.conftest import MANAGER, MANAGER2, MANAGER_CHAT, USER, Client, FakeSession
 from tests.test_trello import FakeTrello, complete_dialog, make_sync
 
@@ -40,14 +41,18 @@ class Env:
 
 
 async def make_env(db: Database, *, trello: bool = True, **settings_kw) -> Env:
-    settings = Settings(bot_token="123:TEST", manager_chat_id=GROUP, **{**ALL_DAY, **settings_kw})
+    # Недельный отчёт в тестах выключен: иначе тест, чьё модельное время переходит в новую неделю, получал бы его.
+    defaults = {**ALL_DAY, "weekly_report": False}
+    settings = Settings(bot_token="123:TEST", manager_chat_id=GROUP, **{**defaults, **settings_kw})
     session = FakeSession()
     bot = Bot("123:TEST", session=session)
     fake = FakeTrello() if trello else None
     notifier = Notifier(bot, db, settings, trello_enabled=trello)
     clients = ClientFollowUp(bot, db, settings)
-    notifier.extra_scans.append(clients.scan)
-    handlers = {**(make_sync(db, fake).handlers if fake else {}), **notifier.handlers, **clients.handlers}
+    reports = Reports(db, settings, notifier)
+    notifier.extra_scans.extend([clients.scan, reports.scan])
+    handlers = {**(make_sync(db, fake).handlers if fake else {}), **notifier.handlers, **clients.handlers,
+                **reports.handlers}
     outbox = Outbox(db, handlers)
     client = Client(build_dispatcher(db, settings, notifier), bot, session)
     return Env(db, client, session, notifier, outbox, fake)

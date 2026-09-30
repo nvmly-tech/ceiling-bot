@@ -1,11 +1,11 @@
-"""Чат менеджеров (и админа): кнопка «Взял в работу», кнопки этапов заявки, команда /status."""
+"""Чат менеджеров (и админа, владельца): кнопка «Взял в работу», кнопки этапов заявки, команды /status и /report."""
 
 from datetime import datetime
 from html import escape
 
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, LinkPreviewOptions, Message
 
 from app.bot.outcomes import on_stage_button
@@ -14,6 +14,7 @@ from app.db import Database
 from app.parsing import replace_phones
 from app.services.health import HealthMonitor
 from app.services.notifier import Notifier
+from app.services.report import REPORT_DAYS_DEFAULT, REPORT_DAYS_MAX, Reports
 
 
 def _without_take(markup: InlineKeyboardMarkup | None, lead_id: int) -> InlineKeyboardMarkup | None:
@@ -74,6 +75,18 @@ async def on_status(
     await message.answer(await monitor.status_text(), parse_mode="HTML")
 
 
+async def on_report(
+    message: Message, command: CommandObject, db: Database, settings: Settings, notifier: Notifier,
+) -> None:
+    """/report [дней] — отчёт по заявкам за последние дни (по умолчанию за неделю)."""
+    allowed = {settings.admin_chat_id, settings.owner_chat_id, await notifier.chat_id()} - {None}
+    if message.chat.id not in allowed:
+        raise SkipHandler  # не наш чат — пусть обработает диалог с клиентом
+    arg = (command.args or "").strip()
+    days = min(int(arg), REPORT_DAYS_MAX) if arg.isdigit() and int(arg) > 0 else REPORT_DAYS_DEFAULT
+    await message.answer(await Reports(db, settings, notifier).for_days(days), parse_mode="HTML")
+
+
 async def on_group_message(message: Message, db: Database, notifier: Notifier) -> None:
     """Запомнить сообщение менеджера о заявке, чтобы удалить его, если клиент удалит заявку: ответ на сообщение
     бота о заявке (и цепочки ответов) или сообщение с телефоном клиента. Текст не храним — только номер.
@@ -102,5 +115,6 @@ def create_manager_router() -> Router:
     r.callback_query.register(on_take, F.data.startswith("take:"))
     r.callback_query.register(on_stage_button, F.data.startswith("st:"))
     r.message.register(on_status, Command("status"))
+    r.message.register(on_report, Command("report"))
     r.message.register(on_group_message, F.chat.type.in_({"group", "supergroup"}))
     return r

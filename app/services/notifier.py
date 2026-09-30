@@ -385,6 +385,10 @@ class Notifier:
             await self.db.add_tg_message(lead_ids, sent.chat.id, sent.message_id, kind)
         return sent
 
+    async def to_owner(self, text: str, *, lead_ids: Sequence[int] = (), kind: str = "") -> Message:
+        """Сообщение владельцу: в OWNER_CHAT_ID, а если он не задан — в группу менеджеров."""
+        return await self._send(text, lead_ids=lead_ids, kind=kind, to=self.settings.owner_chat_id)
+
     async def _lead(self, task: OutboxTask) -> Lead:
         lead = await self.db.get_lead(task.lead_id)
         if lead is None:
@@ -492,7 +496,7 @@ class Notifier:
         elif not in_work_on(lead, task.payload["stage"]):
             return
         text = escalation_text(lead, reason, _at(task.payload["at"]), self.settings.zone)
-        await self._send(text, lead_ids=[lead.id], kind="escalation", to=self.settings.owner_chat_id)
+        await self.to_owner(text, lead_ids=[lead.id], kind="escalation")
 
     async def send_client_messages(self, task: OutboxTask) -> None:
         lead = await self._lead(task)

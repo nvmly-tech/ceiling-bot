@@ -21,6 +21,7 @@ from app.services.health import Alerter, HealthMonitor
 from app.services.llm import LLMProvider, LLMRouter
 from app.services.notifier import Notifier
 from app.services.outbox import Outbox
+from app.services.report import Reports
 from app.services.stt import (
     FetchFile,
     GigaAMTranscriber,
@@ -158,7 +159,8 @@ async def build_app(settings: Settings, bot: Bot | None = None, db: Database | N
     notifier = Notifier(bot, db, settings, trello_enabled=trello is not None, assistant=assistant)
 
     clients = ClientFollowUp(bot, db, settings)
-    notifier.extra_scans.append(clients.scan)
+    reports = Reports(db, settings, notifier)
+    notifier.extra_scans.extend([clients.scan, reports.scan])
     handlers = dict(trello.handlers) if trello else {}
     handlers |= clients.handlers
     if stt:
@@ -166,7 +168,7 @@ async def build_app(settings: Settings, bot: Bot | None = None, db: Database | N
     if settings.manager_chat_id is None:
         log.warning("MANAGER_CHAT_ID не задан — уведомления менеджерам копятся в очереди")
     else:
-        handlers |= notifier.handlers
+        handlers |= notifier.handlers | reports.handlers
     outbox = Outbox(db, handlers)
 
     alerter = Alerter(bot, settings, notifier)

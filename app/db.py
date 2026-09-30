@@ -169,9 +169,10 @@ TG_ESCALATE = "tg.escalate"        # владельцу: заявку никто
 TG_VISIT = "tg.visit"              # менеджерам: клиент ответил о замере (жду / перенести / отменить)
 TG_TO_CLIENT = "tg.to_client"      # клиенту: замер назначен, напоминание накануне, вопросы о качестве
 TG_FEEDBACK = "tg.feedback"        # менеджерам и владельцу: клиент ответил «связались ли» / оценил замер
+TG_REPORT = "tg.report"            # владельцу: недельный отчёт по заявкам
 ALL_KINDS = (CARD_CREATE, CARD_UPDATE, CARD_COMMENT, CARD_TAKE, CARD_ATTACH, CARD_TRANSCRIPT, CARD_DELETE, CARD_STAGE,
              STT_TRANSCRIBE, STT_SHADOW, TG_LEAD, TG_REMIND, TG_CLIENT_MSG, TG_DIGEST, TG_DELETED, TG_PANEL, TG_NUDGE,
-             TG_ESCALATE, TG_VISIT, TG_TO_CLIENT, TG_FEEDBACK)
+             TG_ESCALATE, TG_VISIT, TG_TO_CLIENT, TG_FEEDBACK, TG_REPORT)
 
 Event = tuple[str, dict[str, Any]]
 
@@ -424,6 +425,10 @@ class Database:
         async with self.conn.execute(f"SELECT * FROM leads WHERE {where} ORDER BY id", params) as cur:
             rows = await cur.fetchall()
         return [_lead(r) for r in rows]
+
+    async def leads_created_between(self, since: datetime, until: datetime) -> list[Lead]:
+        """Заявки, созданные за период, — для отчёта владельцу."""
+        return await self._leads("created_at >= ? AND created_at < ?", (now_iso(since), now_iso(until)))
 
     async def leads_to_abandon(self, idle_since: datetime) -> list[Lead]:
         """Анкета не закончена, и клиент молчит с момента idle_since."""
