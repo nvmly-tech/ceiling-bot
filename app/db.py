@@ -1,10 +1,13 @@
 """SQLite: лиды, переписка, очередь исходящих вызовов (outbox), состояние FSM и служебные значения.
 
-Одно соединение на процесс, режим WAL. Время хранится в UTC (ISO 8601).
+Одно соединение на процесс, режим WAL. Время хранится в UTC (ISO 8601). Запись — только через _tx():
+обработчики aiogram и очередь работают параллельно, а транзакция у соединения одна на всех.
 """
 
+import asyncio
 import json
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -278,6 +281,8 @@ class Database:
         self._conn: aiosqlite.Connection | None = None
         # Будит воркер outbox, когда появилась новая задача.
         self.on_enqueue: Callable[[], None] | None = None
+        self._write = asyncio.Lock()
+        self._enqueued = False  # в текущей транзакции поставлены задачи — после commit разбудить воркер
 
     @property
     def conn(self) -> aiosqlite.Connection:
@@ -310,6 +315,21 @@ class Database:
             await self._conn.close()
             self._conn = None
 
+    @asynccontextmanager
+    async def _tx(self) -> AsyncIterator[None]:
+        """Одна транзакция за раз. Без этого commit одной корутины фиксировал чужую незаконченную запись,
+        а rollback — стирал её (второе «Взял» стирало сообщение клиента, пришедшее в ту же миллисекунду)."""
+        async with self._write:
+            self._enqueued = False
+            try:
+                yield
+            except BaseException:
+                await self.conn.rollback()
+                raise
+            await self.conn.commit()
+            if self._enqueued and self.on_enqueue:
+                self.on_enqueue()
+
     async def ping(self) -> None:
         """Проверка для сторожа: база отвечает и пишется."""
         await self.kv_set("_ping", now_iso())
@@ -321,13 +341,13 @@ class Database:
         source: str | None = None,
     ) -> Lead:
         ts = now_iso()
-        cur = await self.conn.execute(
-            "INSERT INTO leads (tg_user_id, chat_id, name, username, is_night, source, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (tg_user_id, chat_id, name, username, int(is_night), source, ts, ts),
-        )
-        await self._enqueue(CARD_CREATE, cur.lastrowid)
-        await self._commit()
+        async with self._tx():
+            cur = await self.conn.execute(
+                "INSERT INTO leads (tg_user_id, chat_id, name, username, is_night, source, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (tg_user_id, chat_id, name, username, int(is_night), source, ts, ts),
+            )
+            await self._enqueue(CARD_CREATE, cur.lastrowid)
         lead = await self.get_lead(cur.lastrowid)
         assert lead is not None
         return lead
@@ -349,18 +369,18 @@ class Database:
         unknown = set(fields) - LEAD_FIELDS
         if unknown:
             raise ValueError(f"Unknown lead fields: {unknown}")
-        if fields:
-            cols = ", ".join(f"{k} = ?" for k in fields)
-            await self.conn.execute(
-                f"UPDATE leads SET {cols}, updated_at = ? WHERE id = ?",
-                (*fields.values(), now_iso(), lead_id),
-            )
-            if fields.keys() & CARD_FIELDS:
-                await self._enqueue(CARD_UPDATE, lead_id, coalesce=True)
-        for kind, payload in events:
-            await self._enqueue(kind, lead_id, payload)
         if fields or events:
-            await self._commit()
+            async with self._tx():
+                if fields:
+                    cols = ", ".join(f"{k} = ?" for k in fields)
+                    await self.conn.execute(
+                        f"UPDATE leads SET {cols}, updated_at = ? WHERE id = ?",
+                        (*fields.values(), now_iso(), lead_id),
+                    )
+                    if fields.keys() & CARD_FIELDS:
+                        await self._enqueue(CARD_UPDATE, lead_id, coalesce=True)
+                for kind, payload in events:
+                    await self._enqueue(kind, lead_id, payload)
         lead = await self.get_lead(lead_id)
         assert lead is not None
         return lead
@@ -371,17 +391,17 @@ class Database:
         """Менеджер берёт лид. False — лид уже кто-то взял (два нажатия одновременно).
         reply_to — сообщение, под которым нажали «Взял»: панель заявки придёт ответом на него.
         Счётчики напоминаний обнуляются: владельцу могли сообщить, что заявку никто не берёт, — теперь новый отсчёт."""
-        cur = await self.conn.execute(
-            "UPDATE leads SET taken_by_id = ?, taken_by_name = ?, taken_by_username = ?, taken_at = ?, updated_at = ?,"
-            " nudges_sent = 0, last_nudge_at = NULL, escalated_at = NULL WHERE id = ? AND taken_at IS NULL",
-            (by_id, by_name, by_username, now_iso(), now_iso(), lead_id),
-        )
-        if cur.rowcount == 0:
-            await self.conn.rollback()
-            return False
-        await self._enqueue(CARD_TAKE, lead_id, {"by": by_name})
-        await self._enqueue(TG_PANEL, lead_id, {"reply_to": reply_to})
-        await self._commit()
+        async with self._tx():
+            cur = await self.conn.execute(
+                "UPDATE leads SET taken_by_id = ?, taken_by_name = ?, taken_by_username = ?, taken_at = ?,"
+                " updated_at = ?, nudges_sent = 0, last_nudge_at = NULL, escalated_at = NULL"
+                " WHERE id = ? AND taken_at IS NULL",
+                (by_id, by_name, by_username, now_iso(), now_iso(), lead_id),
+            )
+            if cur.rowcount == 0:
+                return False  # уже взята: запрос ничего не изменил — откатывать нечего
+            await self._enqueue(CARD_TAKE, lead_id, {"by": by_name})
+            await self._enqueue(TG_PANEL, lead_id, {"reply_to": reply_to})
         return True
 
     async def set_stage(
@@ -421,10 +441,10 @@ class Database:
     async def spend_llm_call(self, lead_id: int, limit: int) -> bool:
         """Списать одно обращение к LLM из бюджета заявки. False — бюджет исчерпан.
         Счётчик в базе, а не в FSM: сброс состояния диалога (/start) его не обнуляет."""
-        cur = await self.conn.execute(
-            "UPDATE leads SET llm_calls = llm_calls + 1 WHERE id = ? AND llm_calls < ?", (lead_id, limit)
-        )
-        await self.conn.commit()
+        async with self._tx():
+            cur = await self.conn.execute(
+                "UPDATE leads SET llm_calls = llm_calls + 1 WHERE id = ? AND llm_calls < ?", (lead_id, limit)
+            )
         return cur.rowcount == 1
 
     async def _leads(self, where: str, params: Sequence[Any] = ()) -> list[Lead]:
@@ -483,13 +503,13 @@ class Database:
         """Записать ответ клиента, если его ещё нет. False — уже отвечал (или кнопку нажали дважды)."""
         if field not in ONCE_FIELDS:
             raise ValueError(f"Not a once-field: {field}")
-        cur = await self.conn.execute(
-            f"UPDATE leads SET {field} = ?, updated_at = ? WHERE id = ? AND {field} IS NULL",
-            (value, now_iso(), lead_id),
-        )
-        if cur.rowcount and field in CARD_FIELDS:
-            await self._enqueue(CARD_UPDATE, lead_id, coalesce=True)
-        await self._commit()
+        async with self._tx():
+            cur = await self.conn.execute(
+                f"UPDATE leads SET {field} = ?, updated_at = ? WHERE id = ? AND {field} IS NULL",
+                (value, now_iso(), lead_id),
+            )
+            if cur.rowcount and field in CARD_FIELDS:
+                await self._enqueue(CARD_UPDATE, lead_id, coalesce=True)
         return cur.rowcount == 1
 
     async def leads_to_ask_contact(self) -> list[Lead]:
@@ -517,38 +537,38 @@ class Database:
     async def delete_lead_data(self, lead_id: int) -> None:
         """Клиент удалил заявку: стереть его данные в одной транзакции. Остаётся обезличенная строка (номер и
         status='deleted') — по ней очередь удалит карточку Trello, если она есть или создаётся прямо сейчас."""
-        lead = await self.get_lead(lead_id)
-        if lead is None or lead.status == "deleted":
-            return
-        # Карточка есть, создаётся прямо сейчас или ждёт настройки Trello — её надо будет удалить.
-        async with self.conn.execute(
-            "SELECT 1 FROM outbox WHERE lead_id = ? AND kind = ?", (lead_id, CARD_CREATE)
-        ) as cur:
-            card_planned = await cur.fetchone() is not None
-        # Невыполненные задачи (карточка, комментарии, уведомления, расшифровки) больше не нужны.
-        await self.conn.execute("DELETE FROM outbox WHERE lead_id = ? AND done_at IS NULL", (lead_id,))
-        await self.conn.execute("DELETE FROM messages WHERE lead_id = ?", (lead_id,))
-        await self.conn.execute(
-            "UPDATE leads SET status = 'deleted', tg_user_id = 0, chat_id = 0, name = NULL, username = NULL,"
-            " object = NULL, area_m2 = NULL, area_text = NULL, ceiling_type = NULL, phone = NULL,"
-            " measure_time = NULL, summary = NULL, hotness = NULL, hotness_reason = NULL, summary_model = NULL,"
-            " summary_status = NULL, updated_at = ? WHERE id = ?",
-            (now_iso(), lead_id),
-        )
-        if lead.trello_card_id or card_planned:
-            await self._enqueue(CARD_DELETE, lead_id)
-        if lead.notified_at or await self.tg_messages(lead_id):
-            await self._enqueue(TG_DELETED, lead_id)  # сообщить менеджеру и убрать сообщения о заявке из группы
-        await self._commit()
+        async with self._tx():
+            lead = await self.get_lead(lead_id)
+            if lead is None or lead.status == "deleted":
+                return
+            # Карточка есть, создаётся прямо сейчас или ждёт настройки Trello — её надо будет удалить.
+            async with self.conn.execute(
+                "SELECT 1 FROM outbox WHERE lead_id = ? AND kind = ?", (lead_id, CARD_CREATE)
+            ) as cur:
+                card_planned = await cur.fetchone() is not None
+            # Невыполненные задачи (карточка, комментарии, уведомления, расшифровки) больше не нужны.
+            await self.conn.execute("DELETE FROM outbox WHERE lead_id = ? AND done_at IS NULL", (lead_id,))
+            await self.conn.execute("DELETE FROM messages WHERE lead_id = ?", (lead_id,))
+            await self.conn.execute(
+                "UPDATE leads SET status = 'deleted', tg_user_id = 0, chat_id = 0, name = NULL, username = NULL,"
+                " object = NULL, area_m2 = NULL, area_text = NULL, ceiling_type = NULL, phone = NULL,"
+                " measure_time = NULL, summary = NULL, hotness = NULL, hotness_reason = NULL, summary_model = NULL,"
+                " summary_status = NULL, updated_at = ? WHERE id = ?",
+                (now_iso(), lead_id),
+            )
+            if lead.trello_card_id or card_planned:
+                await self._enqueue(CARD_DELETE, lead_id)
+            if lead.notified_at or await self.tg_messages(lead_id):
+                await self._enqueue(TG_DELETED, lead_id)  # сообщить менеджеру и убрать сообщения о заявке из группы
 
     # --- сообщения бота в группе менеджеров ---
 
     async def add_tg_message(self, lead_ids: Sequence[int], chat_id: int, message_id: int, kind: str) -> None:
-        await self.conn.executemany(
-            "INSERT INTO tg_messages (lead_id, chat_id, message_id, kind, created_at) VALUES (?, ?, ?, ?, ?)",
-            [(lead_id, chat_id, message_id, kind, now_iso()) for lead_id in lead_ids],
-        )
-        await self.conn.commit()
+        async with self._tx():
+            await self.conn.executemany(
+                "INSERT INTO tg_messages (lead_id, chat_id, message_id, kind, created_at) VALUES (?, ?, ?, ?, ?)",
+                [(lead_id, chat_id, message_id, kind, now_iso()) for lead_id in lead_ids],
+            )
 
     async def tg_messages(self, lead_id: int) -> list[TgMessage]:
         async with self.conn.execute("SELECT * FROM tg_messages WHERE lead_id = ? ORDER BY id", (lead_id,)) as cur:
@@ -572,8 +592,8 @@ class Database:
             return [r[0] for r in await cur.fetchall()]
 
     async def delete_tg_messages(self, lead_id: int) -> None:
-        await self.conn.execute("DELETE FROM tg_messages WHERE lead_id = ?", (lead_id,))
-        await self.conn.commit()
+        async with self._tx():
+            await self.conn.execute("DELETE FROM tg_messages WHERE lead_id = ?", (lead_id,))
 
     # --- переписка ---
 
@@ -587,28 +607,28 @@ class Database:
         file_id: str | None = None,
         model: str | None = None,
     ) -> int:
-        cur = await self.conn.execute(
-            "INSERT INTO messages (lead_id, direction, kind, text, file_id, model, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (lead_id, direction, kind, text, file_id, model, now_iso()),
-        )
-        await self._enqueue(CARD_COMMENT, lead_id, {"message_id": cur.lastrowid})
-        if file_id:
-            await self._enqueue(CARD_ATTACH, lead_id, {"message_id": cur.lastrowid})
-        await self._commit()
+        async with self._tx():
+            cur = await self.conn.execute(
+                "INSERT INTO messages (lead_id, direction, kind, text, file_id, model, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (lead_id, direction, kind, text, file_id, model, now_iso()),
+            )
+            await self._enqueue(CARD_COMMENT, lead_id, {"message_id": cur.lastrowid})
+            if file_id:
+                await self._enqueue(CARD_ATTACH, lead_id, {"message_id": cur.lastrowid})
         return cur.lastrowid
 
     async def set_message_text(self, message_id: int, text: str, model: str | None = None) -> None:
-        await self.conn.execute(
-            "UPDATE messages SET text = ?, model = COALESCE(?, model) WHERE id = ?", (text, model, message_id)
-        )
-        await self.conn.commit()
+        async with self._tx():
+            await self.conn.execute(
+                "UPDATE messages SET text = ?, model = COALESCE(?, model) WHERE id = ?", (text, model, message_id)
+            )
 
     async def set_message_alt(self, message_id: int, text: str, model: str) -> None:
-        await self.conn.execute(
-            "UPDATE messages SET text_alt = ?, text_alt_model = ? WHERE id = ?", (text, model, message_id)
-        )
-        await self.conn.commit()
+        async with self._tx():
+            await self.conn.execute(
+                "UPDATE messages SET text_alt = ?, text_alt_model = ? WHERE id = ?", (text, model, message_id)
+            )
 
     async def stt_pairs(self, since: datetime) -> list[Message]:
         """Голосовые, расшифрованные обеими моделями (основной и теневой), — для сравнения."""
@@ -640,14 +660,15 @@ class Database:
         self, kind: str, lead_id: int | None, payload: dict[str, Any] | None = None,
         *, coalesce: bool = False, delay: timedelta | None = None,
     ) -> None:
-        await self._enqueue(kind, lead_id, payload, coalesce=coalesce, delay=delay)
-        await self._commit()
+        async with self._tx():
+            await self._enqueue(kind, lead_id, payload, coalesce=coalesce, delay=delay)
 
     async def _enqueue(
         self, kind: str, lead_id: int | None, payload: dict[str, Any] | None = None,
         *, coalesce: bool = False, delay: timedelta | None = None,
     ) -> None:
-        """Поставить задачу в очередь. Без commit — вызывающий коммитит вместе со своей записью."""
+        """Поставить задачу в очередь. Только внутри _tx() — вместе с записью, ради которой она ставится."""
+        self._enqueued = True
         if coalesce:
             async with self.conn.execute(
                 "SELECT 1 FROM outbox WHERE kind = ? AND lead_id IS ? AND done_at IS NULL AND attempts = 0",
@@ -663,11 +684,6 @@ class Database:
             (kind, lead_id, queue, json.dumps(payload or {}, ensure_ascii=False),
              now_iso(now + (delay or timedelta())), now_iso(now)),
         )
-
-    async def _commit(self) -> None:
-        await self.conn.commit()
-        if self.on_enqueue:
-            self.on_enqueue()
 
     async def outbox_pending(
         self, kinds: Collection[str] | None = None, *, per_queue: int = 20, limit: int = 1000
@@ -691,15 +707,15 @@ class Database:
         return [OutboxTask(**{**dict(r), "payload": json.loads(r["payload"])}) for r in rows]
 
     async def outbox_done(self, task_id: int) -> None:
-        await self.conn.execute("UPDATE outbox SET done_at = ? WHERE id = ?", (now_iso(), task_id))
-        await self.conn.commit()
+        async with self._tx():
+            await self.conn.execute("UPDATE outbox SET done_at = ? WHERE id = ?", (now_iso(), task_id))
 
     async def outbox_retry(self, task_id: int, error: str, next_attempt_at: str) -> None:
-        await self.conn.execute(
-            "UPDATE outbox SET attempts = attempts + 1, last_error = ?, next_attempt_at = ? WHERE id = ?",
-            (error[:1000], next_attempt_at, task_id),
-        )
-        await self.conn.commit()
+        async with self._tx():
+            await self.conn.execute(
+                "UPDATE outbox SET attempts = attempts + 1, last_error = ?, next_attempt_at = ? WHERE id = ?",
+                (error[:1000], next_attempt_at, task_id),
+            )
 
     async def outbox_stats(self, handled: Collection[str] | None = None) -> dict[str, Any]:
         """Для сторожа и /status: сколько задач ждёт, сколько с ошибками, самая старая ошибочная;
@@ -757,11 +773,11 @@ class Database:
         return row["value"] if row else None
 
     async def kv_set(self, key: str, value: str | None) -> None:
-        await self.conn.execute(
-            "INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (key, value),
-        )
-        await self.conn.commit()
+        async with self._tx():
+            await self.conn.execute(
+                "INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
 
     # --- FSM ---
 
@@ -773,20 +789,20 @@ class Database:
         return row["state"], json.loads(row["data"])
 
     async def fsm_set_state(self, key: str, state: str | None) -> None:
-        await self.conn.execute(
-            "INSERT INTO fsm (key, state) VALUES (?, ?)"
-            " ON CONFLICT(key) DO UPDATE SET state = excluded.state",
-            (key, state),
-        )
-        await self.conn.commit()
+        async with self._tx():
+            await self.conn.execute(
+                "INSERT INTO fsm (key, state) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET state = excluded.state",
+                (key, state),
+            )
 
     async def fsm_set_data(self, key: str, data: dict[str, Any]) -> None:
-        await self.conn.execute(
-            "INSERT INTO fsm (key, data) VALUES (?, ?)"
-            " ON CONFLICT(key) DO UPDATE SET data = excluded.data",
-            (key, json.dumps(data, ensure_ascii=False)),
-        )
-        await self.conn.commit()
+        async with self._tx():
+            await self.conn.execute(
+                "INSERT INTO fsm (key, data) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET data = excluded.data",
+                (key, json.dumps(data, ensure_ascii=False)),
+            )
 
 
 def _lead(row: aiosqlite.Row) -> Lead:
