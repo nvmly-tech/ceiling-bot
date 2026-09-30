@@ -167,7 +167,9 @@ class HealthMonitor:
             await asyncio.wait_for(self.db.ping(), DB_TIMEOUT)
         except Exception as e:  # noqa: BLE001
             report.problems.append(f"база не пишется: {e or type(e).__name__}")
-        for name, last in (("очередь", self.outbox.last_run), ("планировщик", self.notifier.last_scan)):
+        lag = self.outbox.lagging()
+        queue = f"очередь ({lag[0]})" if lag else "очередь"
+        for name, last in ((queue, self.outbox.last_run), ("планировщик", self.notifier.last_scan)):
             if last is None:
                 if uptime > STARTUP_GRACE:
                     report.problems.append(f"{name} не запустилась")

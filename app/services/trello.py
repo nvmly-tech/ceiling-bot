@@ -5,6 +5,7 @@
 вслед за этапами, которые отмечает менеджер (замер, договор, отказ).
 """
 
+import asyncio
 import logging
 import mimetypes
 import re
@@ -263,6 +264,7 @@ class TrelloSync:
         self.list_names = (list_new, list_in_work, *stage_lists)
         self.fetch_file = fetch_file  # скачивание файлов из Telegram для вложений
         self._board: Board | None = None
+        self._board_lock = asyncio.Lock()  # задачи идут параллельно — доску готовим один раз
 
     @property
     def handlers(self):
@@ -279,8 +281,12 @@ class TrelloSync:
 
     async def board(self) -> Board:
         """Найти списки и метки на доске, недостающие создать. Результат кешируется."""
-        if self._board:
+        async with self._board_lock:
+            if self._board is None:
+                self._board = await self._prepare_board()
             return self._board
+
+    async def _prepare_board(self) -> Board:
         lists = {lst["name"]: lst["id"] for lst in await self.client.lists(self.board_id) if not lst.get("closed")}
         for name in self.list_names:
             if name not in lists:
@@ -296,8 +302,7 @@ class TrelloSync:
         new, in_work, measure, won, lost = (lists[name] for name in self.list_names)
         stage_lists = {None: in_work, NO_ANSWER: in_work, MEASURE: measure, THINKING: measure, CONTRACT: won,
                        REFUSED: lost}
-        self._board = Board(new, in_work, labels, stage_lists)
-        return self._board
+        return Board(new, in_work, labels, stage_lists)
 
     def label_ids(self, lead: Lead, board: Board) -> list[str]:
         keys = []

@@ -238,9 +238,9 @@ async def test_tasks_wait_when_trello_not_configured(db):
 
 async def test_enqueue_wakes_worker(db):
     outbox = Outbox(db, {})
-    assert not outbox._wake.is_set()
+    assert not any(event.is_set() for event in outbox._wake.values())
     await db.create_lead(tg_user_id=1, chat_id=1, name="А", username=None, is_night=False)
-    assert outbox._wake.is_set()
+    assert all(event.is_set() for event in outbox._wake.values())  # будит воркеры всех каналов
 
 
 def test_card_name_skips_empty_and_non_phone():
