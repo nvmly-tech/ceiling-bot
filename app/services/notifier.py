@@ -65,6 +65,15 @@ SUMMARY_BUDGET = 8                  # с
 # Telegram даёт боту удалять свои сообщения только 48 ч; берём с запасом — удаление идёт через очередь.
 TG_DELETE_WINDOW = timedelta(hours=47)
 STUCK_NUDGES_MAX = 2                # напоминаний менеджеру о заявке без итога — на каждый этап
+LIST_MAX = 20                       # заявок в одном списке (сводка, напоминание, эскалация); дальше — «и ещё N»
+DIGEST_WINDOW = timedelta(hours=24)  # в утреннюю сводку — заявки за последние сутки (старые уже были в прошлых)
+# Списки заявок одним сообщением: вид → (заголовок, кнопки «Взял», сколько ждёт). Утром после ночи с заявками
+# напоминания о каждой по отдельности — это десятки сообщений разом, а Telegram пускает в группу 20 в минуту.
+LISTS = {
+    "digest": ("☀️ <b>Доброе утро! Ночных заявок ждут менеджера: {n}</b>", True, False),
+    "remind_list": ("⏰ <b>Заявки ждут менеджера: {n}</b>", True, True),
+    "untaken_list": ("⚠️ <b>Заявки так никто и не взял: {n}</b>", False, True),
+}
 LOW_RATING = 3                      # оценка замера не выше — сообщить владельцу
 RATING_MAX = 5
 # Ответы клиента на вопросы бота уходят своими уведомлениями — в «клиент дописал» их не повторяем.
@@ -126,14 +135,23 @@ def lead_text(
     return f"{header}\n\n{lead_body(lead, previous, zone)}"
 
 
-def digest_text(leads: list[Lead]) -> str:
-    lines = [f"☀️ <b>Доброе утро! Ночных заявок ждут менеджера: {len(leads)}</b>", ""]
-    for lead in leads:
+def digest_text(
+    leads: list[Lead], kind: str = "digest", settings: Settings | None = None, now: datetime | None = None,
+) -> str:
+    """Список заявок одним сообщением (сводка, напоминание, эскалация) — не больше LIST_MAX строк."""
+    header, _, waits = LISTS[kind]
+    lines = [header.format(n=len(leads)), ""]
+    for lead in leads[:LIST_MAX]:
         facts = ", ".join(escape(x) for x in (lead.object, _area(lead), lead.phone) if x)
         status = "" if lead.status == "qualified" else " — <i>анкета не завершена</i>"
         link = f' · <a href="{escape(lead.trello_card_url)}">Trello</a>' if lead.trello_card_url else ""
+        wait = ""
+        if waits and settings and now and lead.notified_at:
+            wait = f" — ждёт {span(now - next_work_start(_at(lead.notified_at), settings))}"
         lines.append(f"• <b>№{lead.id}</b> {escape(lead.name or 'Клиент')}" + (f": {facts}" if facts else "")
-                     + status + link)
+                     + status + wait + link)
+    if len(leads) > LIST_MAX:
+        lines.append(f"… и ещё {len(leads) - LIST_MAX} — полный список в Trello")
     return "\n".join(lines)
 
 
@@ -156,7 +174,7 @@ def lead_keyboard(lead: Lead) -> InlineKeyboardMarkup:
 
 
 def digest_keyboard(leads: list[Lead]) -> InlineKeyboardMarkup:
-    buttons = [take_button(lead, f"✅ Взял №{lead.id}") for lead in leads]
+    buttons = [take_button(lead, f"✅ Взял №{lead.id}") for lead in leads[:LIST_MAX]]
     return InlineKeyboardMarkup(inline_keyboard=[buttons[i : i + 3] for i in range(0, len(buttons), 3)])
 
 
@@ -575,15 +593,17 @@ class Notifier:
             if datetime.fromisoformat(m.created_at) < cutoff:
                 continue
             others = []
-            if m.kind == "digest":
+            if m.kind in LISTS:
                 for i in await self.db.tg_message_leads(m.chat_id, m.message_id):
                     if i != lead_id and (lead := await self.db.get_lead(i)) and lead.status != "deleted":
                         others.append(lead)
             try:
                 if others:
+                    buttons = LISTS[m.kind][1]
                     await self.bot.edit_message_text(
-                        digest_text(others), chat_id=m.chat_id, message_id=m.message_id, parse_mode="HTML",
-                        reply_markup=digest_keyboard([x for x in others if not x.taken_at]),
+                        digest_text(others, m.kind, self.settings, datetime.now(UTC)), chat_id=m.chat_id,
+                        message_id=m.message_id, parse_mode="HTML",
+                        reply_markup=digest_keyboard([x for x in others if not x.taken_at]) if buttons else None,
                         link_preview_options=LinkPreviewOptions(is_disabled=True),
                     )
                 else:
@@ -595,12 +615,20 @@ class Notifier:
         await self.db.delete_tg_messages(lead_id)
 
     async def send_digest(self, task: OutboxTask) -> None:
+        """Список заявок одним сообщением: утренняя сводка, напоминание или эскалация владельцу."""
+        kind = task.payload.get("kind", "digest")
         leads = [
             lead for i in task.payload["lead_ids"]
-            if (lead := await self.db.get_lead(i)) and not lead.taken_at and lead.status != "deleted"
+            if (lead := await self.db.get_lead(i)) and not lead.taken_at and lead.status not in ("cancelled", "deleted")
         ]
-        if leads:
-            await self._send(digest_text(leads), digest_keyboard(leads), lead_ids=[x.id for x in leads], kind="digest")
+        if not leads:
+            return  # пока ждали очереди, заявки взяли
+        text = digest_text(leads, kind, self.settings, datetime.now(UTC))
+        ids = [x.id for x in leads]
+        if kind == "untaken_list":
+            await self.to_owner(text, lead_ids=ids, kind=kind)
+        else:
+            await self._send(text, digest_keyboard(leads), lead_ids=ids, kind=kind)
 
     # --- планировщик ---
 
@@ -621,26 +649,16 @@ class Notifier:
 
         waiting = await self.db.leads_waiting()
         work_now = is_work_time(now.astimezone(s.zone), s.work_start, s.work_end)
-        for lead in waiting:
-            if lead.reminders_sent >= s.remind_max or not work_now:
-                continue
-            base = datetime.fromisoformat(lead.last_reminder_at or lead.notified_at)
-            if now >= next_work_start(base, s) + timedelta(minutes=s.remind_after_min):
-                await self.db.update_lead(
-                    lead.id, reminders_sent=lead.reminders_sent + 1, last_reminder_at=now_iso(now),
-                    events=[(TG_REMIND, {})],
-                )
-
         if work_now:
+            await self._remind([lead for lead in waiting if self._remind_due(lead, now)], now)
             for lead in await self.db.leads_in_work():
                 await self._follow_up(lead, now)
-            for lead in waiting:
-                await self._escalate_untaken(lead, now)
+            await self._escalate_untaken([lead for lead in waiting if self._untaken_due(lead, now)], now)
 
         today = now.astimezone(s.zone).date().isoformat()
         if work_now and await self.db.kv_get(KV_LAST_DIGEST) != today:
             await self.db.kv_set(KV_LAST_DIGEST, today)
-            night = [lead.id for lead in waiting if lead.is_night]
+            night = [lead.id for lead in waiting if lead.is_night and _at(lead.notified_at) >= now - DIGEST_WINDOW]
             if night:
                 await self.db.enqueue(TG_DIGEST, None, {"lead_ids": night})
 
@@ -657,15 +675,44 @@ class Notifier:
             await self.db.update_lead(lead.id, escalated_at=now_iso(now),
                                       events=[(TG_ESCALATE, {**payload, "reason": "stuck"})])
 
-    async def _escalate_untaken(self, lead: Lead, now: datetime) -> None:
-        """Все напоминания о новой заявке ушли, а её так никто и не взял — сообщить владельцу."""
+    def _remind_due(self, lead: Lead, now: datetime) -> bool:
+        s = self.settings
+        if lead.reminders_sent >= s.remind_max:
+            return False
+        base = _at(lead.last_reminder_at or lead.notified_at)
+        return now >= next_work_start(base, s) + timedelta(minutes=s.remind_after_min)
+
+    def _untaken_due(self, lead: Lead, now: datetime) -> bool:
+        """Все напоминания о новой заявке ушли, а её так никто и не взял."""
         s = self.settings
         if lead.escalated_at or lead.reminders_sent < s.remind_max:
-            return
+            return False
         last = _at(lead.last_reminder_at or lead.notified_at)
-        if now >= next_work_start(last, s) + timedelta(minutes=s.remind_after_min):
-            await self.db.update_lead(lead.id, escalated_at=now_iso(now),
-                                      events=[(TG_ESCALATE, {"stage": None, "at": now_iso(now), "reason": "untaken"})])
+        return now >= next_work_start(last, s) + timedelta(minutes=s.remind_after_min)
+
+    async def _remind(self, due: list[Lead], now: datetime) -> None:
+        """Одна заявка — личное напоминание; несколько сразу (утро после ночи) — одним списком.
+        Счётчики и список — не одной транзакцией: при сбое между ними заявка получит напоминание в следующий раз."""
+        if len(due) == 1:
+            lead = due[0]
+            await self.db.update_lead(lead.id, reminders_sent=lead.reminders_sent + 1, last_reminder_at=now_iso(now),
+                                      events=[(TG_REMIND, {})])
+            return
+        for lead in due:
+            await self.db.update_lead(lead.id, reminders_sent=lead.reminders_sent + 1, last_reminder_at=now_iso(now))
+        if due:
+            await self.db.enqueue(TG_DIGEST, None, {"lead_ids": [lead.id for lead in due], "kind": "remind_list"})
+
+    async def _escalate_untaken(self, due: list[Lead], now: datetime) -> None:
+        """Заявки, которые так никто и не взял, — владельцу: одна — отдельным сообщением, несколько — списком."""
+        if len(due) == 1:
+            payload = {"stage": None, "at": now_iso(now), "reason": "untaken"}
+            await self.db.update_lead(due[0].id, escalated_at=now_iso(now), events=[(TG_ESCALATE, payload)])
+            return
+        for lead in due:
+            await self.db.update_lead(lead.id, escalated_at=now_iso(now))
+        if due:
+            await self.db.enqueue(TG_DIGEST, None, {"lead_ids": [lead.id for lead in due], "kind": "untaken_list"})
 
     async def run(self) -> None:
         while True:
