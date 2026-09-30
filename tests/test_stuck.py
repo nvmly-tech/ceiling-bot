@@ -8,7 +8,8 @@ from aiogram.methods import SendMessage
 from aiogram.types import User
 
 from app import stages
-from app.db import NUDGES_OFF, Database, now_iso
+from app.db import Database, now_iso
+from app.schema import NUDGES_OFF
 from tests.conftest import FakeSession
 from tests.test_notifier import GROUP, Env, make_env
 from tests.test_trello import complete_dialog
