@@ -172,6 +172,10 @@ STAGE_BUTTONS = {
 }
 
 
+# Что клиент ответил о назначенном замере — строкой на панели.
+VISIT_MARKS = {"yes": "✅ подтвердил замер", "move": "🔁 просит перенести замер", "cancel": "❌ отменил замер"}
+
+
 def stage_keyboard(lead: Lead) -> InlineKeyboardMarkup:
     buttons = []
     for stage in NEXT[lead.stage]:
@@ -190,6 +194,8 @@ def panel_text(lead: Lead, zone: ZoneInfo) -> str:
         f"Ведёт: <b>{escape(lead.taken_by_name or '—')}</b>",
         f"Этап: {escape(stage_text(lead.stage, lead.measure_at, lead.refuse_reason, zone))}",
     ]
+    if lead.stage == MEASURE and lead.visit_answer:
+        lines.append(f"Клиент: {VISIT_MARKS[lead.visit_answer]}")
     if lead.stage is None:
         lines.append("Отметьте итог, когда он будет 👇")
     return "\n".join(lines)

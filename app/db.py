@@ -119,6 +119,7 @@ MIGRATIONS = [
     ("leads", "rating_asked_at", "TEXT"),          # когда попросили оценить замер
     ("leads", "rating", "INTEGER"),                # оценка замера клиентом, 1–5
     ("leads", "source", "TEXT"),                   # метка источника из ссылки t.me/<бот>?start=<метка>
+    ("leads", "visit_answer", "TEXT"),             # ответ клиента о назначенном замере: yes | move | cancel
 ]
 
 HISTORY_LIMIT = 50  # сколько прошлых заявок клиента читаем (показываем — несколько последних)
@@ -145,7 +146,7 @@ LEAD_FIELDS = CARD_FIELDS | {
     "trello_card_id", "trello_card_url", "completed_at", "notified_status", "notified_at",
     "reminders_sent", "last_reminder_at", "client_msgs_notified", "summary_status", "stage_at", "stage_by_name",
     "nudges_sent", "last_nudge_at", "escalated_at", "measure_reminded_for", "contact_asked_at", "contact_answer",
-    "rating_asked_at",
+    "rating_asked_at", "visit_answer",
 }
 ONCE_FIELDS = {"contact_answer", "rating"}  # ответы клиента: принимается только первый
 
@@ -232,6 +233,7 @@ class Lead:
     rating_asked_at: str | None = None
     rating: int | None = None
     source: str | None = None
+    visit_answer: str | None = None
 
 
 @dataclass
@@ -389,8 +391,8 @@ class Database:
         """Менеджер отметил этап. Дата замера сохраняется и после него (для истории и вопросов клиенту)."""
         fields: dict[str, Any] = {
             "stage": stage, "stage_at": now_iso(), "stage_by_name": by_name, "refuse_reason": reason,
-            # Новый этап — новый отсчёт напоминаний и эскалации.
-            "nudges_sent": 0, "last_nudge_at": None, "escalated_at": None,
+            # Новый этап — новый отсчёт напоминаний и эскалации; ответ клиента о прежнем замере уже не в счёт.
+            "nudges_sent": 0, "last_nudge_at": None, "escalated_at": None, "visit_answer": None,
         }
         if measure_at is not None:
             fields["measure_at"] = measure_at
@@ -491,9 +493,10 @@ class Database:
         return cur.rowcount == 1
 
     async def leads_to_ask_contact(self) -> list[Lead]:
-        """Взятые заявки без единой отметки этапа, клиента ещё не спрашивали, связались ли с ним."""
+        """Взятые заявки, у которых этап не отмечали ни разу (stage_at пуст: вернули в работу после итога —
+        с клиентом уже общались), а клиента ещё не спрашивали, связались ли с ним."""
         return await self._leads(
-            "taken_at IS NOT NULL AND stage IS NULL AND contact_asked_at IS NULL"
+            "taken_at IS NOT NULL AND stage IS NULL AND stage_at IS NULL AND contact_asked_at IS NULL"
             " AND status NOT IN ('cancelled', 'deleted')"
         )
 

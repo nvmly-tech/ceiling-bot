@@ -186,3 +186,51 @@ async def test_rating_accepted_once_and_validated(env: Env):
     assert (await env.db.get_lead(1)).rating == 4
     await env.tick()
     assert not [m for m in env.group() if "дописал" in m.text]  # ответы — не «клиент дописал»
+
+
+# --- вопросы не к месту ---
+
+
+async def test_no_contact_question_after_reopen(env: Env):
+    """Заявку вернули в работу после итога — с клиентом уже общались, «связались ли с вами?» неуместно."""
+    t0 = await take(env)
+    await env.db.set_stage(1, stages.REFUSED, by_name="Иван", reason="other")
+    await env.db.set_stage(1, None, by_name="Иван")
+    await env.tick(t0 + timedelta(hours=5))
+    assert not [m for m in client_msgs(env) if "связался" in m.text]
+
+
+@pytest.mark.parametrize("answer", ["cancel", "move"])
+async def test_no_rating_when_client_cancelled_or_moved_visit(env: Env, answer: str):
+    """Клиент отменил замер кнопкой, а менеджер этап не обновил — оценивать нечего."""
+    await take(env)
+    at = datetime.now(UTC) + timedelta(days=1)
+    await env.db.set_stage(1, stages.MEASURE, by_name="Иван", measure_at=now_iso(at))
+    await env.tick()
+    await env.client.press(f"visit:1:{answer}:{stages.stamp(now_iso(at))}")
+    await env.tick(at + timedelta(hours=4))
+    assert not [m for m in client_msgs(env) if "Оцените" in m.text]
+
+
+async def test_rating_asked_when_client_confirmed_visit(env: Env):
+    await take(env)
+    at = datetime.now(UTC) + timedelta(days=1)
+    await env.db.set_stage(1, stages.MEASURE, by_name="Иван", measure_at=now_iso(at))
+    await env.tick()
+    await env.client.press(f"visit:1:yes:{stages.stamp(now_iso(at))}")
+    await env.tick(at + timedelta(hours=4))
+    assert "Оцените" in client_msgs(env)[-1].text
+
+
+async def test_panel_shows_client_answer_about_visit(env: Env):
+    from app.services.notifier import panel_text
+
+    await take(env)
+    at = datetime.now(UTC) + timedelta(days=1)
+    await env.db.set_stage(1, stages.MEASURE, by_name="Иван", measure_at=now_iso(at))
+    await env.tick()
+    await env.client.press(f"visit:1:cancel:{stages.stamp(now_iso(at))}")
+    zone = env.notifier.settings.zone
+    assert "Клиент: ❌ отменил замер" in panel_text(await env.db.get_lead(1), zone)
+    await env.db.set_stage(1, stages.MEASURE, by_name="Иван", measure_at=now_iso(at + timedelta(days=1)))
+    assert "Клиент:" not in panel_text(await env.db.get_lead(1), zone)  # новое время — ответ о старом не в счёт

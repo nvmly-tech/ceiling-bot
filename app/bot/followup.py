@@ -10,10 +10,9 @@ from aiogram.types import CallbackQuery, Message
 
 from app.bot import texts
 from app.db import TG_FEEDBACK, TG_VISIT, Database, Lead, now_iso
-from app.services.client_followup import RATINGS
+from app.services.client_followup import RATINGS, SCRIPT
 from app.stages import MEASURE, stamp
 
-SCRIPT = "script"
 VISIT_REPLIES = {"yes": texts.VISIT_YES_REPLY, "move": texts.VISIT_MOVE_REPLY, "cancel": texts.VISIT_CANCEL_REPLY}
 
 
@@ -38,7 +37,7 @@ async def on_visit_button(cb: CallbackQuery, db: Database) -> None:
     await cb.message.edit_text(f"{cb.message.text}\n\n✓ {label}")
     # kind «visit»: в переписке и карточке есть, а менеджеру — отдельным уведомлением, не в «клиент дописал».
     await db.add_message(lead.id, direction="in", kind="visit", text=label)
-    await db.enqueue(TG_VISIT, lead.id, {"answer": answer, "at": lead.measure_at})
+    await db.update_lead(lead.id, visit_answer=answer, events=[(TG_VISIT, {"answer": answer, "at": lead.measure_at})])
     reply = VISIT_REPLIES[answer]
     await cb.message.answer(reply)
     await db.add_message(lead.id, direction="out", kind="text", text=reply, model=SCRIPT)

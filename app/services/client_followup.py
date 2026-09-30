@@ -59,8 +59,10 @@ def measure_is(lead: Lead, measure_at: str) -> bool:
 
 
 def measured(lead: Lead) -> bool:
-    """Замер, судя по этапу, состоялся: отказ до назначенного времени — это отмена, оценивать нечего."""
-    return not (lead.stage == REFUSED and lead.stage_at < lead.measure_at)
+    """Замер, судя по тому, что известно, состоялся. Отказ до назначенного времени — это отмена; клиент нажал
+    «перенести» или «отменить», а менеджер этап не обновил — тоже: оценивать нечего."""
+    cancelled_before = lead.stage == REFUSED and lead.stage_at < lead.measure_at
+    return not cancelled_before and lead.visit_answer not in ("move", "cancel")
 
 
 class ClientFollowUp:
@@ -84,7 +86,7 @@ class ClientFollowUp:
             return text, visit_keyboard(lead, ("yes", "move", "cancel"))
         if what == "ask_contact":
             # Менеджер успел отметить итог или клиент уже ответил — спрашивать поздно.
-            if not lead.taken_at or lead.stage is not None or lead.contact_answer:
+            if not lead.taken_at or lead.stage_at or lead.contact_answer:
                 return None
             return texts.CONTACT_ASK.format(lead_id=lead.id), contact_keyboard(lead)
         if what == "ask_rating":
