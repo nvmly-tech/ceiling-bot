@@ -71,6 +71,8 @@ async def test_client_says_nobody_called(env: Env):
     assert "st:1:measure" in buttons(alert)
     [owner] = env.session.sent(OWNER)
     assert "№1" in owner.text and "ещё не связались" in owner.text
+    # Владельцу — не просьба «позвоните» с кнопками, а кто взял заявку и когда.
+    assert "Заявку взял(а) Иван Менеджеров" in owner.text and "👇" not in owner.text
     lead = await env.db.get_lead(1)
     assert lead.contact_answer == "no"
     assert (await env.db.get_messages(1, direction="in"))[-1].kind == "contact"

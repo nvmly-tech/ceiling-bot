@@ -268,8 +268,9 @@ def visit_text(lead: Lead, answer: str, measure_at: str, who: str, zone: ZoneInf
     )
 
 
-def feedback_text(lead: Lead, about: str, answer: str | int, who: str, at: datetime) -> str:
-    """Клиент ответил, связались ли с ним, или оценил замер."""
+def feedback_text(lead: Lead, about: str, answer: str | int, who: str | None, at: datetime) -> str:
+    """Клиент ответил, связались ли с ним, или оценил замер. who — упоминание того, кто ведёт заявку
+    (сообщение в группу, с просьбой к нему); None — сообщение владельцу: только факты."""
     head = f"<b>№{lead.id}</b> · {escape(lead.name or 'Клиент')}"
     if about == "rating":
         return (f"{'⭐' * int(answer)} {head} оценил(а) замер: <b>{answer} из {RATING_MAX}</b>\n"
@@ -278,8 +279,10 @@ def feedback_text(lead: Lead, about: str, answer: str | int, who: str, at: datet
         return f"✅ {head}: клиент говорит, что с ним связались\n{who}, отметьте итог 👇"
     phone = f" · {escape(lead.phone)}" if lead.phone else ""
     waited = span(at - _at(lead.taken_at))
-    return (f"❗ {head}{phone}: клиент говорит, что с ним ещё не связались (заявку взяли {waited} назад)\n"
-            f"{who}, позвоните, пожалуйста 👇")
+    complaint = f"❗ {head}{phone}: клиент говорит, что с ним ещё не связались"
+    if who is None:
+        return f"{complaint}\nЗаявку взял(а) {escape(lead.taken_by_name or '—')} {waited} назад"
+    return f"{complaint} (заявку взяли {waited} назад)\n{who}, позвоните, пожалуйста 👇"
 
 
 def nudge_due(lead: Lead, s: Settings) -> datetime | None:
@@ -493,13 +496,13 @@ class Notifier:
         bad = answer == "no" if about == "contact" else int(answer) <= LOW_RATING
         markup = stage_keyboard(lead) if about == "contact" and in_work_on(lead, lead.stage) else None
 
-        def make_text(who: str) -> str:
+        def make_text(who: str | None) -> str:
             return feedback_text(lead, about, answer, who, at)
 
         await self._send_mentioning(lead, make_text, markup, "feedback")
         owner = self.settings.owner_chat_id
         if bad and owner and owner != await self.chat_id():
-            await self._send(make_text(mention(lead, link=False)), lead_ids=[lead.id], kind="feedback", to=owner)
+            await self._send(make_text(None), lead_ids=[lead.id], kind="feedback", to=owner)
 
     async def _send_mentioning(
         self, lead: Lead, make_text: Callable[[str], str], markup: InlineKeyboardMarkup | None, kind: str,
