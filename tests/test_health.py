@@ -353,6 +353,30 @@ async def test_status_command(db):
     assert all("Состояние бота" not in m.text for m in session.sent()[n:])
 
 
+async def test_status_llm_line_after_restart(db):
+    """После перезапуска модель ещё никому не отвечала — это не поломка, статус говорит, что проверка прошла."""
+    ds = CheckedProvider("deepseek (router.cheap)")
+    monitor, clock, _, router = await make_monitor(db, providers=[ds])
+
+    async def line():
+        return next(s for s in (await monitor.status_text()).splitlines() if s.startswith("✅ deepseek"))
+
+    assert await line() == "✅ deepseek (router.cheap) — с запуска ещё не отвечала, первая проверка — в течение 5 мин"
+
+    await monitor.check_models()  # бесплатная проверка /models прошла
+    clock.tick(minutes=3)
+    assert await line() == "✅ deepseek (router.cheap) — с запуска ещё не отвечала, проверка ок 3 мин назад"
+
+    router.record_ok("deepseek (router.cheap)", clock())  # ответила клиенту
+    clock.tick(seconds=30)
+    assert await line() == "✅ deepseek (router.cheap) — ответ 30 с назад"
+
+    clock.tick(minutes=10)
+    await monitor.check_models()  # клиентов давно не было — сторож снова проверил доступность
+    clock.tick(minutes=2)
+    assert await line() == "✅ deepseek (router.cheap) — ответ 12 мин назад, проверка ок 2 мин назад"
+
+
 # --- алерт из systemd ---
 
 

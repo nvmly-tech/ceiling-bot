@@ -62,6 +62,17 @@ def ago(moment: datetime | None, now: datetime) -> str:
     return f"{sec // 3600} ч {sec % 3600 // 60} мин назад"
 
 
+def llm_activity(h: Health, now: datetime) -> str:
+    """Для /status: когда модель последний раз отвечала клиенту и когда сторож проверил её доступность.
+    Время ответа живёт только в памяти, поэтому после перезапуска его нет — это не поломка."""
+    checked = f"проверка ок {ago(h.last_check, now)}" if h.last_check else None
+    if h.last_ok is None:
+        return "с запуска ещё не отвечала, " + (
+            checked or f"первая проверка — в течение {MODEL_CHECK_INTERVAL // 60} мин")
+    answered = f"ответ {ago(h.last_ok, now)}"
+    return f"{answered}, {checked}" if checked and h.last_check > h.last_ok else answered
+
+
 @dataclass
 class Report:
     problems: list[str] = field(default_factory=list)
@@ -227,6 +238,7 @@ class HealthMonitor:
                     self.llm.record_fail(p.label, str(e) or type(e).__name__)
                 else:
                     # Успешный /models не обнуляет ошибки живых запросов: API может отвечать, а генерация — нет.
+                    h.last_check = now
                     if h.is_down:
                         self.llm.record_ok(p.label)
         for t in self.stt:
@@ -336,7 +348,7 @@ class HealthMonitor:
                 elif h.failures:
                     lines.append(f"⚠️ {escape(p.label)} — ошибок подряд: {h.failures}")
                 else:
-                    lines.append(f"✅ {escape(p.label)} — ответ {ago(h.last_ok, now)}")
+                    lines.append(f"✅ {escape(p.label)} — {llm_activity(h, now)}")
         else:
             lines.append("LLM: не настроена — анкета по скрипту")
         if self.stt:

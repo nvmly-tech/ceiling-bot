@@ -108,6 +108,7 @@ class Health:
     down_until: datetime | None = None
     last_error: str | None = None
     last_ok: datetime | None = None
+    last_check: datetime | None = None  # последняя удачная проверка сторожа (/models) — для /status
 
     def available(self, now: datetime) -> bool:
         return self.down_until is None or now >= self.down_until
