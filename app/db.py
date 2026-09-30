@@ -114,6 +114,10 @@ MIGRATIONS = [
     ("leads", "last_nudge_at", "TEXT"),
     ("leads", "escalated_at", "TEXT"),             # когда сообщили владельцу (на текущем этапе)
     ("leads", "measure_reminded_for", "TEXT"),     # measure_at, о котором клиенту уже напомнили накануне
+    ("leads", "contact_asked_at", "TEXT"),         # когда спросили клиента «с вами связался менеджер?»
+    ("leads", "contact_answer", "TEXT"),           # yes | no
+    ("leads", "rating_asked_at", "TEXT"),          # когда попросили оценить замер
+    ("leads", "rating", "INTEGER"),                # оценка замера клиентом, 1–5
 ]
 
 NUDGES_OFF = 1000  # «напоминания уже исчерпаны»: так помечены заявки, взятые до появления напоминаний
@@ -121,19 +125,27 @@ NUDGES_OFF = 1000  # «напоминания уже исчерпаны»: та�
 # все давно взятые заявки разом получили бы напоминания и эскалации владельцу.
 BACKFILL = {
     ("leads", "escalated_at"): f"UPDATE leads SET escalated_at = created_at, nudges_sent = {NUDGES_OFF}",
+    # Клиентов по давно взятым заявкам и давно прошедшим замерам вопросами не беспокоим.
+    ("leads", "contact_asked_at"): "UPDATE leads SET contact_asked_at = created_at WHERE taken_at IS NOT NULL",
+    ("leads", "rating_asked_at"): (
+        "UPDATE leads SET rating_asked_at = created_at"
+        " WHERE measure_at IS NOT NULL AND measure_at < strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')"
+    ),
 }
 
 # Поля анкеты: их изменение обновляет карточку в Trello.
 CARD_FIELDS = {
     "name", "username", "object", "area_m2", "area_text", "ceiling_type",
     "phone", "measure_time", "status", "is_night", "summary", "hotness", "hotness_reason", "summary_model",
-    "stage", "measure_at", "refuse_reason",
+    "stage", "measure_at", "refuse_reason", "rating",
 }
 LEAD_FIELDS = CARD_FIELDS | {
     "trello_card_id", "trello_card_url", "completed_at", "notified_status", "notified_at",
     "reminders_sent", "last_reminder_at", "client_msgs_notified", "summary_status", "stage_at", "stage_by_name",
-    "nudges_sent", "last_nudge_at", "escalated_at", "measure_reminded_for",
+    "nudges_sent", "last_nudge_at", "escalated_at", "measure_reminded_for", "contact_asked_at", "contact_answer",
+    "rating_asked_at",
 }
+ONCE_FIELDS = {"contact_answer", "rating"}  # ответы клиента: принимается только первый
 
 # Задачи outbox. Префикс до точки — канал: у каждого лида своя очередь на канал.
 CARD_CREATE = "trello.card_create"
@@ -155,10 +167,11 @@ TG_PANEL = "tg.panel"              # панель взятой заявки: к�
 TG_NUDGE = "tg.nudge"              # напоминание менеджеру: взятая заявка без итога
 TG_ESCALATE = "tg.escalate"        # владельцу: заявку никто не взял / нет итога
 TG_VISIT = "tg.visit"              # менеджерам: клиент ответил о замере (жду / перенести / отменить)
-TG_TO_CLIENT = "tg.to_client"      # клиенту: замер назначен, напоминание накануне
+TG_TO_CLIENT = "tg.to_client"      # клиенту: замер назначен, напоминание накануне, вопросы о качестве
+TG_FEEDBACK = "tg.feedback"        # менеджерам и владельцу: клиент ответил «связались ли» / оценил замер
 ALL_KINDS = (CARD_CREATE, CARD_UPDATE, CARD_COMMENT, CARD_TAKE, CARD_ATTACH, CARD_TRANSCRIPT, CARD_DELETE, CARD_STAGE,
              STT_TRANSCRIBE, STT_SHADOW, TG_LEAD, TG_REMIND, TG_CLIENT_MSG, TG_DIGEST, TG_DELETED, TG_PANEL, TG_NUDGE,
-             TG_ESCALATE, TG_VISIT, TG_TO_CLIENT)
+             TG_ESCALATE, TG_VISIT, TG_TO_CLIENT, TG_FEEDBACK)
 
 Event = tuple[str, dict[str, Any]]
 
@@ -211,6 +224,10 @@ class Lead:
     last_nudge_at: str | None = None
     escalated_at: str | None = None
     measure_reminded_for: str | None = None
+    contact_asked_at: str | None = None
+    contact_answer: str | None = None
+    rating_asked_at: str | None = None
+    rating: int | None = None
 
 
 @dataclass
@@ -434,6 +451,33 @@ class Database:
         return await self._leads(
             "taken_at IS NOT NULL AND status NOT IN ('cancelled', 'deleted')"
             " AND (stage IS NULL OR stage NOT IN ('contract', 'refused'))"
+        )
+
+    async def set_once(self, lead_id: int, field: str, value: Any) -> bool:
+        """Записать ответ клиента, если его ещё нет. False — уже отвечал (или кнопку нажали дважды)."""
+        if field not in ONCE_FIELDS:
+            raise ValueError(f"Not a once-field: {field}")
+        cur = await self.conn.execute(
+            f"UPDATE leads SET {field} = ?, updated_at = ? WHERE id = ? AND {field} IS NULL",
+            (value, now_iso(), lead_id),
+        )
+        if cur.rowcount and field in CARD_FIELDS:
+            await self._enqueue(CARD_UPDATE, lead_id, coalesce=True)
+        await self._commit()
+        return cur.rowcount == 1
+
+    async def leads_to_ask_contact(self) -> list[Lead]:
+        """Взятые заявки без единой отметки этапа, клиента ещё не спрашивали, связались ли с ним."""
+        return await self._leads(
+            "taken_at IS NOT NULL AND stage IS NULL AND contact_asked_at IS NULL"
+            " AND status NOT IN ('cancelled', 'deleted')"
+        )
+
+    async def leads_to_ask_rating(self) -> list[Lead]:
+        """Заявки с замером, оценку которого у клиента ещё не спрашивали."""
+        return await self._leads(
+            "measure_at IS NOT NULL AND rating_asked_at IS NULL AND status NOT IN ('cancelled', 'deleted')"
+            " AND stage IN ('measure', 'thinking', 'contract', 'refused')"
         )
 
     async def leads_to_remind_measure(self) -> list[Lead]:

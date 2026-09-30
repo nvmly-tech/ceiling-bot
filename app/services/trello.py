@@ -192,7 +192,10 @@ def stage_lines(lead: Lead, zone: ZoneInfo) -> list[str]:
     if not lead.taken_at:
         return []
     stage = md(stage_text(lead.stage, lead.measure_at, lead.refuse_reason, zone))
-    return [f"**Этап:** {stage} · ведёт {md(lead.taken_by_name)}"]
+    lines = [f"**Этап:** {stage} · ведёт {md(lead.taken_by_name)}"]
+    if lead.rating:
+        lines.append(f"**Оценка замера:** {'⭐' * lead.rating} {lead.rating} из 5")
+    return lines
 
 
 def summary_lines(lead: Lead) -> list[str]:

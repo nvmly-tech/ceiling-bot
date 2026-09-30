@@ -24,6 +24,7 @@ from app.db import (
     TG_DELETED,
     TG_DIGEST,
     TG_ESCALATE,
+    TG_FEEDBACK,
     TG_LEAD,
     TG_NUDGE,
     TG_PANEL,
@@ -53,6 +54,10 @@ SUMMARY_BUDGET = 8                  # с
 # Telegram даёт боту удалять свои сообщения только 48 ч; берём с запасом — удаление идёт через очередь.
 TG_DELETE_WINDOW = timedelta(hours=47)
 STUCK_NUDGES_MAX = 2                # напоминаний менеджеру о заявке без итога — на каждый этап
+LOW_RATING = 3                      # оценка замера не выше — сообщить владельцу
+RATING_MAX = 5
+# Ответы клиента на вопросы бота уходят своими уведомлениями — в «клиент дописал» их не повторяем.
+ANSWER_KINDS = {"visit", "contact", "rating"}
 
 
 class NotReady(Exception):
@@ -238,6 +243,20 @@ def visit_text(lead: Lead, answer: str, measure_at: str, who: str, zone: ZoneInf
     )
 
 
+def feedback_text(lead: Lead, about: str, answer: str | int, who: str, at: datetime) -> str:
+    """Клиент ответил, связались ли с ним, или оценил замер."""
+    head = f"<b>№{lead.id}</b> · {escape(lead.name or 'Клиент')}"
+    if about == "rating":
+        return (f"{'⭐' * int(answer)} {head} оценил(а) замер: <b>{answer} из {RATING_MAX}</b>\n"
+                f"Вёл(а): {escape(lead.taken_by_name or '—')}")
+    if answer == "yes":
+        return f"✅ {head}: клиент говорит, что с ним связались\n{who}, отметьте итог 👇"
+    phone = f" · {escape(lead.phone)}" if lead.phone else ""
+    waited = span(at - _at(lead.taken_at))
+    return (f"❗ {head}{phone}: клиент говорит, что с ним ещё не связались (заявку взяли {waited} назад)\n"
+            f"{who}, позвоните, пожалуйста 👇")
+
+
 def nudge_due(lead: Lead, s: Settings) -> datetime | None:
     """Когда напомнить тому, кто взял заявку, что итога нет; None — не напоминаем."""
     if lead.nudges_sent >= STUCK_NUDGES_MAX:
@@ -309,6 +328,7 @@ class Notifier:
             TG_NUDGE: self.send_nudge,
             TG_ESCALATE: self.send_escalation,
             TG_VISIT: self.send_visit,
+            TG_FEEDBACK: self.send_feedback,
         }
 
     async def switch_chat(self, old_id: int, new_id: int) -> None:
@@ -432,6 +452,23 @@ class Notifier:
         markup = stage_keyboard(lead) if answer != "yes" and in_work_on(lead, lead.stage) else None
         await self._send_mentioning(lead, lambda who: visit_text(lead, answer, measure_at, who, zone), markup, "visit")
 
+    async def send_feedback(self, task: OutboxTask) -> None:
+        """Клиент ответил на вопрос бота. Плохие новости («не связались», низкая оценка) — ещё и владельцу."""
+        lead = await self.db.get_lead(task.lead_id)
+        if lead is None or lead.status == "deleted":
+            return
+        about, answer, at = task.payload["about"], task.payload["answer"], _at(task.payload["at"])
+        bad = answer == "no" if about == "contact" else int(answer) <= LOW_RATING
+        markup = stage_keyboard(lead) if about == "contact" and in_work_on(lead, lead.stage) else None
+
+        def make_text(who: str) -> str:
+            return feedback_text(lead, about, answer, who, at)
+
+        await self._send_mentioning(lead, make_text, markup, "feedback")
+        owner = self.settings.owner_chat_id
+        if bad and owner and owner != await self.chat_id():
+            await self._send(make_text(mention(lead, link=False)), lead_ids=[lead.id], kind="feedback", to=owner)
+
     async def _send_mentioning(
         self, lead: Lead, make_text: Callable[[str], str], markup: InlineKeyboardMarkup | None, kind: str,
     ) -> None:
@@ -460,7 +497,7 @@ class Notifier:
     async def send_client_messages(self, task: OutboxTask) -> None:
         lead = await self._lead(task)
         msgs = await self.db.get_messages(lead.id, after_id=lead.client_msgs_notified, direction="in")
-        msgs = [m for m in msgs if m.kind != "visit"]  # ответ о замере уже ушёл отдельным уведомлением
+        msgs = [m for m in msgs if m.kind not in ANSWER_KINDS]  # они уже ушли отдельными уведомлениями
         if not msgs:
             return
         lines = [f"💬 <b>№{lead.id} · {escape(lead.name or 'Клиент')} дописал(а) после анкеты:</b>", ""]
