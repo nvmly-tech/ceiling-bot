@@ -116,7 +116,8 @@ class Outbox:
         try:
             await self.handlers[task.kind](task)
         except Exception as e:  # noqa: BLE001 — любая ошибка внешнего вызова уходит в ретрай
-            delay = backoff(task.attempts)
+            # 429 от Telegram: ждём столько, сколько он просит, — повтор раньше только продлит блокировку.
+            delay = max(backoff(task.attempts), timedelta(seconds=getattr(e, "retry_after", 0) or 0))
             error = redact(str(e) or type(e).__name__)  # ошибка попадёт в базу и в /status
             log.warning("outbox #%s %s (лид %s): %s; повтор через %s", task.id, task.kind, task.lead_id, error, delay)
             await self.db.outbox_retry(task.id, error, (now + delay).isoformat(timespec="seconds"))

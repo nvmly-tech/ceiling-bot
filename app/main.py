@@ -21,6 +21,7 @@ from app.services.health import Alerter, HealthMonitor
 from app.services.llm import LLMProvider, LLMRouter
 from app.services.notifier import Notifier
 from app.services.outbox import Outbox
+from app.services.ratelimit import ChatRateLimiter
 from app.services.report import Reports
 from app.services.stt import (
     FetchFile,
@@ -176,6 +177,7 @@ async def build_app(settings: Settings, bot: Bot | None = None, db: Database | N
         bot, db, settings, outbox, notifier, alerter, llm=llm, stt=stt.transcribers if stt else None
     )
     bot.session.middleware(monitor.session_middleware)
+    bot.session.middleware(ChatRateLimiter().middleware)  # не больше 18 сообщений в минуту в каждую группу
     dp = build_dispatcher(db, settings, notifier, stt, assistant, monitor)
     return App(bot, db, dp, outbox, notifier, monitor, trello, stt, llm)
 
