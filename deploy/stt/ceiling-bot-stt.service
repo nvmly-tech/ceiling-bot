@@ -1,0 +1,48 @@
+[Unit]
+Description=GigaAM speech-to-text for ceiling-bot
+# Запускается сокетом при первом подключении; без расшифровок GIGAAM_IDLE_EXIT секунд — выходит сам.
+Requires=ceiling-bot-stt.socket
+
+[Service]
+ExecStart=/opt/ceiling-bot-stt/venv/bin/python /opt/ceiling-bot-stt/worker.py
+StandardOutput=journal
+StandardError=journal
+Environment=OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 HOME=/tmp
+Environment=GIGAAM_IDLE_EXIT=600
+# Модель одна на процесс, запросы — по одному: 71 с аудио — ~8 с и ~820 МБ. В лимит входит и кэш файлов модели
+# (~300 МБ): на живом голосовом пик доходил до 1.1 ГБ, поэтому 1.4 ГБ — с запасом, но так, чтобы боту (~0.2 ГБ)
+# хватало памяти на сервере с 2 ГБ.
+MemoryMax=1400M
+# Бот важнее: процессор (одно ядро) — в первую очередь ему, а при нехватке памяти ядро убьёт расшифровку,
+# а не бота — бот переключится на Groq.
+CPUWeight=50
+OOMScoreAdjust=500
+
+DynamicUser=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+# ProcSubset=pid не ставим: onnxruntime читает /proc/cpuinfo и без него падает (ABRT).
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+MemoryDenyWriteExecute=yes
+UMask=0077

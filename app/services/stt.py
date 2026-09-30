@@ -83,8 +83,9 @@ def model_label(t: Transcriber) -> str:
 
 
 class GigaAMTranscriber:
-    """GigaAM на этом же сервере: сервис ceiling-bot-stt (deploy/stt), unix-сокет, процесс на запрос.
-    Голос не покидает сервер. Расшифровок — не больше одной за раз: модели нужно ~0.8 ГБ памяти."""
+    """GigaAM на этом же сервере: сервис ceiling-bot-stt (deploy/stt), unix-сокет, одно подключение — один
+    запрос; модель в сервисе одна и грузится один раз. Голос не покидает сервер. Бот шлёт не больше одной
+    расшифровки за раз: сервис всё равно считает по одной, а лишние подключения только ждали бы в очереди."""
 
     label = GIGAAM
 
@@ -110,7 +111,7 @@ class GigaAMTranscriber:
                 await writer.wait_closed()
         lines = [line for line in data.splitlines() if line.strip()]
         if not lines:
-            raise SttError("GigaAM: пустой ответ — обработчик упал (journalctl -u 'ceiling-bot-stt@*')")
+            raise SttError("GigaAM: пустой ответ — обработчик упал (journalctl -u ceiling-bot-stt)")
         try:
             answer = json.loads(lines[-1])
         except ValueError:

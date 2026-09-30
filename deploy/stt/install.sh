@@ -27,11 +27,18 @@ install -m 644 "$SRC/worker.py" "$APP/worker.py"
 # Обработчик работает от временного пользователя: читать может всё, писать — никто.
 chmod -R a+rX,go-w "$APP"
 
-for unit in ceiling-bot-stt.socket ceiling-bot-stt@.service; do
+# До 01.10.2026 был процесс на каждый запрос (Accept=yes, ceiling-bot-stt@.service): модель грузилась каждый
+# раз, а под наплывом голосовых их оказывалось две. Старый юнит убираем.
+if [ -f /etc/systemd/system/ceiling-bot-stt@.service ]; then
+    systemctl stop ceiling-bot-stt.socket 'ceiling-bot-stt@*' 2>/dev/null || true
+    rm -f /etc/systemd/system/ceiling-bot-stt@.service
+fi
+for unit in ceiling-bot-stt.socket ceiling-bot-stt.service; do
     install -m 644 "$SRC/$unit" "/etc/systemd/system/$unit"
 done
 systemctl daemon-reload
 systemctl enable --quiet ceiling-bot-stt.socket
+systemctl stop ceiling-bot-stt.service 2>/dev/null || true  # новый worker.py подхватится при следующем запросе
 systemctl restart ceiling-bot-stt.socket
 
 echo ">> проверка: PING и расшифровка секунды тишины"
@@ -48,5 +55,5 @@ silence = subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "
 answer = ask(b"TRANSCRIBE\n" + silence, 120)
 print("   TRANSCRIBE:", answer)
 if "error" in answer:
-    raise SystemExit("!! расшифровка не работает — journalctl -u 'ceiling-bot-stt@*' -n 50")
+    raise SystemExit("!! расшифровка не работает — journalctl -u ceiling-bot-stt -n 50")
 PY
