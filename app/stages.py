@@ -5,7 +5,13 @@
 """
 
 from datetime import datetime, time
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from app.db import Lead  # db сам импортирует этот модуль
 
 NO_ANSWER = "no_answer"
 MEASURE = "measure"
@@ -40,6 +46,7 @@ NEXT: dict[str | None, tuple[str, ...]] = {
     REFUSED: (REOPEN,),
 }
 WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+HISTORY_SHOWN = 3  # сколько прошлых заявок клиента показывать
 
 
 def when_text(moment: datetime, zone: ZoneInfo) -> str:
@@ -56,6 +63,27 @@ def stage_text(stage: str | None, measure_at: str | None, reason: str | None, zo
     if stage == REFUSED and reason:
         text += f": {REFUSE_REASONS.get(reason, reason)}"
     return text
+
+
+def history_text(lead: "Lead", zone: ZoneInfo) -> str:
+    """«№5 от 12.09.26 — ✅ договор (Иван)» — прошлая заявка клиента одной строкой."""
+    created = datetime.fromisoformat(lead.created_at).astimezone(zone)
+    if lead.taken_at:
+        state = stage_text(lead.stage, lead.measure_at, lead.refuse_reason, zone)
+        if lead.taken_by_name:
+            state += f" ({lead.taken_by_name})"
+    else:
+        state = "в работу не взята" if lead.status == "qualified" else "анкета не завершена"
+    return f"№{lead.id} от {created:%d.%m.%y} — {state}"
+
+
+def history_lines(previous: "Sequence[Lead]", zone: ZoneInfo) -> list[str]:
+    """Прошлые заявки клиента (новые — первыми) для уведомления и карточки: чтобы не звонили двое
+    и не называли разные цены."""
+    lines = [history_text(lead, zone) for lead in previous[:HISTORY_SHOWN]]
+    if len(previous) > HISTORY_SHOWN:
+        lines.append(f"и ещё {len(previous) - HISTORY_SHOWN}")
+    return lines
 
 
 def stamp(measure_at: str) -> str:

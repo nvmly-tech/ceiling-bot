@@ -55,11 +55,12 @@ def minutes_to_take(lead: Lead, settings: Settings) -> int:
     return max(0, int((datetime.fromisoformat(lead.taken_at) - start).total_seconds() // 60))
 
 
-def _leads_section(leads: Sequence[Lead]) -> list[str]:
+def _leads_section(leads: Sequence[Lead], repeats: int) -> list[str]:
     status = Counter(lead.status for lead in leads)
     hot = Counter(lead.hotness for lead in leads)
     kinds = {f"{HOT_ICONS[h]} {HOT_FORMS[h]}": hot[h] for h in HOT_FORMS}
     kinds["🌙 ночных"] = sum(lead.is_night for lead in leads)
+    kinds["🔁 повторных"] = repeats
     lines = [f"<b>Заявок:</b> {len(leads)}", "• " + _joined({
         "анкета заполнена": status["qualified"], "не завершили": status["abandoned"] + status["new"],
         "закрыты клиентом": status["cancelled"] + status["deleted"],
@@ -124,8 +125,10 @@ def _clients_section(leads: Sequence[Lead]) -> list[str]:
 
 def report_text(
     leads: Sequence[Lead], since: datetime, until: datetime, settings: Settings, *, label: str | None = None,
+    repeats: int = 0,
 ) -> str:
-    """Текст отчёта (HTML для Telegram). label — подпись периода вместо дат («за 7 дней»)."""
+    """Текст отчёта (HTML для Telegram). label — подпись периода вместо дат («за 7 дней»);
+    repeats — сколько заявок от клиентов, которые уже обращались."""
     zone = settings.zone
     last_day = (until - timedelta(seconds=1)).astimezone(zone)
     dates = f"{since.astimezone(zone):%d.%m}–{last_day:%d.%m}"
@@ -133,7 +136,8 @@ def report_text(
     if not leads:
         return f"{header}\n\nЗаявок за период не было."
     sections = [
-        _leads_section(leads), _reaction_section(leads, settings), _outcomes_section(leads), _clients_section(leads),
+        _leads_section(leads, repeats), _reaction_section(leads, settings), _outcomes_section(leads),
+        _clients_section(leads),
     ]
     return "\n".join([header, "", *(line for section in sections for line in section)])
 
@@ -148,7 +152,9 @@ class Reports:
 
     async def text(self, since: datetime, until: datetime, *, label: str | None = None) -> str:
         leads = await self.db.leads_created_between(since, until)
-        return report_text(leads, since, until, self.settings, label=label)
+        live = [lead for lead in leads if lead.status not in ("cancelled", "deleted")]
+        repeats = sum([bool(await self.db.previous_leads(lead)) for lead in live])
+        return report_text(leads, since, until, self.settings, label=label, repeats=repeats)
 
     async def for_days(self, days: int) -> str:
         """Отчёт за последние days дней — для команды /report."""

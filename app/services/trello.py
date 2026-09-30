@@ -8,7 +8,7 @@
 import logging
 import mimetypes
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -32,7 +32,7 @@ from app.db import (
     OutboxTask,
 )
 from app.services.tgfiles import FileTooLarge
-from app.stages import CONTRACT, MEASURE, NO_ANSWER, REFUSED, THINKING, stage_text
+from app.stages import CONTRACT, MEASURE, NO_ANSWER, REFUSED, THINKING, history_lines, stage_text
 
 log = logging.getLogger(__name__)
 
@@ -158,7 +158,7 @@ STATUS_NAMES = {
 }
 
 
-def card_desc(lead: Lead, zone: ZoneInfo) -> str:
+def card_desc(lead: Lead, zone: ZoneInfo, previous: Sequence[Lead] = ()) -> str:
     area = lead.area_text
     if lead.area_m2 is not None and lead.area_text and f"{lead.area_m2:g}" not in lead.area_text:
         area = f"{lead.area_text} (~{lead.area_m2:g} м²)"
@@ -179,6 +179,7 @@ def card_desc(lead: Lead, zone: ZoneInfo) -> str:
         f"**Замер:** {md(lead.measure_time) or dash}",
         "",
         *summary_lines(lead),
+        *previous_lines(previous, zone),
         f"**Клиент в Telegram:** {contact} (ID {lead.tg_user_id})",
         *([f"**Источник:** {md(lead.source)}"] if lead.source else []),
         f"**Создана:** {created:%d.%m.%Y %H:%M} ({zone.key})",
@@ -186,6 +187,13 @@ def card_desc(lead: Lead, zone: ZoneInfo) -> str:
         "Переписка — в комментариях.",
     ]
     return "\n".join(lines)
+
+
+def previous_lines(previous: Sequence[Lead], zone: ZoneInfo) -> list[str]:
+    """Прошлые заявки этого клиента."""
+    if not previous:
+        return []
+    return ["**Уже обращался:**", *(f"- {md(line)}" for line in history_lines(previous, zone)), ""]
 
 
 def stage_lines(lead: Lead, zone: ZoneInfo) -> list[str]:
@@ -305,6 +313,9 @@ class TrelloSync:
             raise TrelloError(f"lead {task.lead_id} not found")
         return lead
 
+    async def _desc(self, lead: Lead) -> str:
+        return card_desc(lead, self.zone, await self.db.previous_leads(lead))
+
     async def _card_id(self, lead: Lead) -> str:
         if not lead.trello_card_id:
             # Сюда не попадаем при нормальном порядке: создание карточки идёт первой задачей лида.
@@ -317,7 +328,7 @@ class TrelloSync:
             return  # уже создана (повтор задачи после сбоя) или клиент удалил заявку
         board = await self.board()
         card = await self.client.create_card(
-            board.list_new, card_name(lead), card_desc(lead, self.zone), self.label_ids(lead, board)
+            board.list_new, card_name(lead), await self._desc(lead), self.label_ids(lead, board)
         )
         await self.db.update_lead(lead.id, trello_card_id=card["id"], trello_card_url=card.get("shortUrl"))
         log.info("Trello: карточка для лида %s создана: %s", lead.id, card.get("shortUrl"))
@@ -339,7 +350,7 @@ class TrelloSync:
         await self.client.update_card(
             card_id,
             name=card_name(lead),
-            desc=card_desc(lead, self.zone),
+            desc=await self._desc(lead),
             idLabels=",".join(manual + self.label_ids(lead, board)),
         )
 
@@ -348,7 +359,7 @@ class TrelloSync:
         lead = await self._lead(task)
         board = await self.board()
         card_id = await self._card_id(lead)
-        await self.client.update_card(card_id, idList=board.list_in_work, desc=card_desc(lead, self.zone))
+        await self.client.update_card(card_id, idList=board.list_in_work, desc=await self._desc(lead))
         await self.client.add_comment(card_id, f"✅ Взял в работу: **{md(task.payload['by'])}**")
 
     async def stage_card(self, task: OutboxTask) -> None:

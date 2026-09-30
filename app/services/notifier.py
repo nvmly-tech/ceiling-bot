@@ -37,7 +37,18 @@ from app.db import (
 )
 from app.parsing import clip
 from app.services.llm import LLMError
-from app.stages import CONTRACT, MEASURE, NEXT, NO_ANSWER, REFUSED, REOPEN, THINKING, stage_text, when_text
+from app.stages import (
+    CONTRACT,
+    MEASURE,
+    NEXT,
+    NO_ANSWER,
+    REFUSED,
+    REOPEN,
+    THINKING,
+    history_lines,
+    stage_text,
+    when_text,
+)
 from app.worktime import is_work_time
 
 log = logging.getLogger(__name__)
@@ -74,7 +85,7 @@ def _area(lead: Lead) -> str | None:
     return f"~{lead.area_m2:g} м²" if lead.area_m2 is not None else lead.area_text
 
 
-def lead_body(lead: Lead) -> str:
+def lead_body(lead: Lead, previous: Sequence[Lead] = (), zone: ZoneInfo | None = None) -> str:
     who = escape(lead.name or "Клиент")
     if lead.username:
         who += f" (@{escape(lead.username)})"
@@ -88,6 +99,9 @@ def lead_body(lead: Lead) -> str:
         lines.append(f"🗓 Замер: {escape(lead.measure_time)}")
     if lead.source:
         lines.append(f"📣 Источник: {escape(lead.source)}")
+    if previous and zone:
+        lines.append("🔁 <b>Уже обращался:</b>")
+        lines.extend(f"• {escape(line)}" for line in history_lines(previous, zone))
     if lead.hotness:
         reason = f" — {escape(lead.hotness_reason)}" if lead.hotness_reason else ""
         lines.append(f"{HOT_ICONS.get(lead.hotness, '')} <b>{escape(lead.hotness)}</b>{reason}")
@@ -99,14 +113,17 @@ def lead_body(lead: Lead) -> str:
     return "\n".join(lines)
 
 
-def lead_text(lead: Lead, reason: str, waiting_min: int | None = None) -> str:
+def lead_text(
+    lead: Lead, reason: str, waiting_min: int | None = None, *, previous: Sequence[Lead] = (),
+    zone: ZoneInfo | None = None,
+) -> str:
     night = " · 🌙 ночная" if lead.is_night else ""
     header = {
         "qualified": f"🔥 <b>Новая заявка №{lead.id}</b>{night}",
         "abandoned": f"⏸ <b>Заявка №{lead.id}: анкета не завершена</b>{night}",
         "remind": f"⏰ <b>Заявку №{lead.id} никто не взял</b> — ждёт {waiting_min} мин",
     }[reason]
-    return f"{header}\n\n{lead_body(lead)}"
+    return f"{header}\n\n{lead_body(lead, previous, zone)}"
 
 
 def digest_text(leads: list[Lead]) -> str:
@@ -422,14 +439,17 @@ class Notifier:
         if lead.taken_at:
             return
         lead = await self._summarize(lead)
-        await self._send(lead_text(lead, task.payload["reason"]), lead_keyboard(lead), lead_ids=[lead.id], kind="lead")
+        text = lead_text(lead, task.payload["reason"], previous=await self.db.previous_leads(lead),
+                         zone=self.settings.zone)
+        await self._send(text, lead_keyboard(lead), lead_ids=[lead.id], kind="lead")
 
     async def send_reminder(self, task: OutboxTask) -> None:
         lead = await self._lead(task)
         if lead.taken_at:
             return
         waiting = datetime.now(UTC) - next_work_start(datetime.fromisoformat(lead.notified_at), self.settings)
-        text = lead_text(lead, "remind", max(1, int(waiting.total_seconds() // 60)))
+        text = lead_text(lead, "remind", max(1, int(waiting.total_seconds() // 60)),
+                         previous=await self.db.previous_leads(lead), zone=self.settings.zone)
         await self._send(text, lead_keyboard(lead), lead_ids=[lead.id], kind="remind")
 
     async def send_panel(self, task: OutboxTask) -> None:

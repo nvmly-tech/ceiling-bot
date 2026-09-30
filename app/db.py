@@ -121,6 +121,7 @@ MIGRATIONS = [
     ("leads", "source", "TEXT"),                   # метка источника из ссылки t.me/<бот>?start=<метка>
 ]
 
+HISTORY_LIMIT = 50  # сколько прошлых заявок клиента читаем (показываем — несколько последних)
 NUDGES_OFF = 1000  # «напоминания уже исчерпаны»: так помечены заявки, взятые до появления напоминаний
 # Выполняется один раз — когда колонка появляется в существующей базе. Без этого после обновления бота
 # все давно взятые заявки разом получили бы напоминания и эскалации владельцу.
@@ -428,6 +429,21 @@ class Database:
         async with self.conn.execute(f"SELECT * FROM leads WHERE {where} ORDER BY id", params) as cur:
             rows = await cur.fetchall()
         return [_lead(r) for r in rows]
+
+    async def previous_leads(self, lead: Lead) -> list[Lead]:
+        """Прошлые заявки того же клиента — с того же Telegram-аккаунта или с тем же телефоном; новые — первыми.
+        Удалённые и закрытые клиентом не в счёт."""
+        same = "tg_user_id = ?"
+        params: list[Any] = [lead.id, lead.tg_user_id]
+        if lead.phone and lead.phone.startswith("+"):  # «не оставил номер» — не признак одного человека
+            same += " OR phone = ?"
+            params.append(lead.phone)
+        async with self.conn.execute(
+            f"SELECT * FROM leads WHERE id < ? AND status NOT IN ('cancelled', 'deleted') AND ({same})"
+            f" ORDER BY id DESC LIMIT {HISTORY_LIMIT}",
+            params,
+        ) as cur:
+            return [_lead(r) for r in await cur.fetchall()]
 
     async def leads_created_between(self, since: datetime, until: datetime) -> list[Lead]:
         """Заявки, созданные за период, — для отчёта владельцу."""
