@@ -36,7 +36,7 @@ LEAD_FIELDS = CARD_FIELDS | {
     "trello_card_id", "trello_card_url", "completed_at", "notified_status", "notified_at",
     "reminders_sent", "last_reminder_at", "client_msgs_notified", "summary_status", "stage_at", "stage_by_name",
     "nudges_sent", "last_nudge_at", "escalated_at", "measure_reminded_for", "contact_asked_at", "contact_answer",
-    "rating_asked_at", "visit_answer",
+    "rating_asked_at", "visit_answer", "manager_reply_at",
 }
 ONCE_FIELDS = {"contact_answer", "rating"}  # ответы клиента: принимается только первый
 
@@ -124,6 +124,7 @@ class Lead:
     rating: int | None = None
     source: str | None = None
     visit_answer: str | None = None
+    manager_reply_at: str | None = None
 
 
 @dataclass
@@ -482,6 +483,14 @@ class Database:
     async def tg_messages(self, lead_id: int) -> list[TgMessage]:
         async with self.conn.execute("SELECT * FROM tg_messages WHERE lead_id = ? ORDER BY id", (lead_id,)) as cur:
             return [_row(TgMessage, r) for r in await cur.fetchall()]
+
+    async def tg_message(self, chat_id: int, message_id: int) -> TgMessage | None:
+        """Сообщение бота в группе — о какой оно заявке и какого вида (например, подсказка «ответьте клиенту»)."""
+        async with self.conn.execute(
+            "SELECT * FROM tg_messages WHERE chat_id = ? AND message_id = ? ORDER BY id LIMIT 1", (chat_id, message_id)
+        ) as cur:
+            row = await cur.fetchone()
+        return _row(TgMessage, row) if row else None
 
     async def tg_message_leads(self, chat_id: int, message_id: int) -> list[int]:
         """Заявки, о которых одно сообщение (сводка)."""

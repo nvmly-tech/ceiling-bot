@@ -9,6 +9,7 @@ from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramBadRequest, TelegramMigrateToChat
 from aiogram.methods import (
     AnswerCallbackQuery,
+    CopyMessage,
     DeleteMessage,
     EditMessageReplyMarkup,
     EditMessageText,
@@ -16,9 +17,10 @@ from aiogram.methods import (
     GetUpdates,
     SendChatAction,
     SendMessage,
+    SetMessageReaction,
     TelegramMethod,
 )
-from aiogram.types import CallbackQuery, Chat, Contact, File, Message, PhotoSize, Update, User, Voice
+from aiogram.types import CallbackQuery, Chat, Contact, File, Message, MessageId, PhotoSize, Update, User, Voice
 
 from app.config import Settings
 from app.db import Database
@@ -55,8 +57,11 @@ class FakeSession(BaseSession):
             chat_id = method.chat_id or CHAT.id
             chat = CHAT if chat_id == CHAT.id else Chat(id=chat_id, type="group")
             return Message(message_id=self._msg_id, date=datetime.now(UTC), chat=chat, text=method.text)
-        if isinstance(method, EditMessageReplyMarkup):
+        if isinstance(method, EditMessageReplyMarkup | SetMessageReaction):
             return True
+        if isinstance(method, CopyMessage):
+            self._msg_id += 1
+            return MessageId(message_id=self._msg_id)
         if isinstance(method, DeleteMessage):
             if method.chat_id in self.migrate:
                 new_id = self.migrate[method.chat_id]
@@ -88,6 +93,9 @@ class FakeSession(BaseSession):
 
     def edits(self) -> list[EditMessageText]:
         return [c for c in self.calls if isinstance(c, EditMessageText)]
+
+    def copies(self, chat_id: int | None = None) -> list[CopyMessage]:
+        return [c for c in self.calls if isinstance(c, CopyMessage) and (chat_id is None or c.chat_id == chat_id)]
 
 
 class Client:

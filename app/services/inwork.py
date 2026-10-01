@@ -1,7 +1,7 @@
 """Взятые заявки: когда напомнить менеджеру, когда сообщить владельцу, и тексты этих сообщений — а также
 сообщений об ответах клиента (замер, «связались ли», оценка). Отправляет Notifier."""
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from html import escape
 from zoneinfo import ZoneInfo
 
@@ -11,12 +11,21 @@ from app.stages import CONTRACT, MEASURE, NO_ANSWER, REFUSED, THINKING, stage_te
 from app.worktime import next_work_start
 
 STUCK_NUDGES_MAX = 2                # напоминаний менеджеру о заявке без итога — на каждый этап
+# После ответа менеджера клиенту через бота столько бот сам клиенту не отвечает: идёт разговор с человеком.
+HUMAN_TALK = timedelta(hours=12)
 LOW_RATING = 3                      # оценка замера не выше — сообщить владельцу
 RATING_MAX = 5
 
 
 def parse_ts(ts: str) -> datetime:
     return datetime.fromisoformat(ts)
+
+
+def talking_to_manager(lead: Lead | None, now: datetime | None = None) -> bool:
+    """Менеджер недавно ответил клиенту через бота — бот не вмешивается в разговор."""
+    if lead is None or not lead.manager_reply_at:
+        return False
+    return (now or datetime.now(UTC)) - parse_ts(lead.manager_reply_at) < HUMAN_TALK
 
 
 def span(delta: timedelta) -> str:

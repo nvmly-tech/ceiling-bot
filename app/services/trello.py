@@ -225,6 +225,9 @@ def stt_signature(msg: Message) -> str:
 
 def comment_text(msg: Message, zone: ZoneInfo) -> str:
     when = f"{_local(msg.created_at, zone):%d.%m %H:%M}"
+    if msg.direction == "out" and msg.kind == "manager":
+        attached = " (во вложениях)" if msg.file_id else ""
+        return f"👔 **Менеджер {md(msg.model)}** · {when}\n\n{md(msg.text)}{attached}"
     if msg.direction == "out":
         model = MODEL_NAMES.get(msg.model or "script", msg.model)
         return f"🤖 **Бот** · {when}\n\n{md(msg.text)}\n\n_— модель: {model}_"

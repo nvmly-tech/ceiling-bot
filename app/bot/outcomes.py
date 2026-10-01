@@ -11,7 +11,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from app.config import Settings
 from app.db import Database, Lead, now_iso
-from app.services.notifier import Notifier, panel_text, stage_keyboard
+from app.services.notifier import Notifier, panel_keyboard, panel_text
 from app.stages import (
     CONTRACT,
     MEASURE,
@@ -95,7 +95,7 @@ def picker(action: str, value: str, lead: Lead, settings: Settings) -> InlineKey
         return hours_keyboard(lead.id, day, settings) if day else None
     if action == "refuse":
         return reasons_keyboard(lead.id)
-    return stage_keyboard(lead)
+    return panel_keyboard(lead)
 
 
 def stage_values(action: str, value: str, settings: Settings) -> dict | None:
@@ -111,7 +111,7 @@ def stage_values(action: str, value: str, settings: Settings) -> dict | None:
 
 async def _show_panel(message: Message, lead: Lead, settings: Settings) -> None:
     await message.edit_text(
-        panel_text(lead, settings.zone), parse_mode="HTML", reply_markup=stage_keyboard(lead),
+        panel_text(lead, settings.zone), parse_mode="HTML", reply_markup=panel_keyboard(lead),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 

@@ -45,6 +45,7 @@ from app.bot.states import EDITS, QUESTIONS, EditLead, Lead
 from app.config import Settings
 from app.db import TG_CLIENT_MSG, Database
 from app.parsing import clip, normalize_phone, parse_area, replace_phones
+from app.services.inwork import talking_to_manager
 from app.services.llm import LLMError
 from app.worktime import local_now, manager_eta, work_time
 
@@ -367,6 +368,21 @@ async def on_measure_time(
     await advance(message, state, db, settings, lead_id)
 
 
+# --- разговор с менеджером ---
+
+HUMAN_REPLY_DELAY = 5  # с: ответы клиента менеджеру собираем в одно уведомление, но не ждём минуту
+
+
+async def on_human_talk(message: Message, state: FSMContext, db: Database, item: Incoming) -> None:
+    """Менеджер недавно ответил клиенту через бота: бот не отвечает сам (ни LLM, ни анкета) — сообщение клиента
+    уходит менеджерам почти сразу. Команды (/start, /order) работают как обычно — они зарегистрированы раньше."""
+    lead_id = (await state.get_data()).get("lead_id")
+    if lead_id is None or not talking_to_manager(await db.get_lead(lead_id)):
+        raise SkipHandler
+    await log_in(db, lead_id, item)
+    await db.enqueue(TG_CLIENT_MSG, lead_id, coalesce=True, delay=timedelta(seconds=HUMAN_REPLY_DELAY))
+
+
 # --- после анкеты ---
 
 
@@ -428,6 +444,7 @@ def create_router() -> Router:
     r.callback_query.register(on_delete_button, F.data.startswith("delete:"))
     r.callback_query.register(on_stale_button)
 
+    r.message.register(on_human_talk, StateFilter(*QUESTIONS, Lead.done))
     r.message.register(on_llm_answer, StateFilter(*QUESTIONS, Lead.done), TEXT_OR_VOICE)
     r.message.register(on_object_text, Lead.object, TEXT_OR_VOICE)
     r.message.register(on_area_text, Lead.area, TEXT_OR_VOICE)

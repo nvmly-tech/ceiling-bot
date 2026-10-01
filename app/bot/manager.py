@@ -9,6 +9,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, LinkPreviewOptions, Message
 
 from app.bot.outcomes import on_stage_button
+from app.bot.relay import on_manager_reply, on_reply_button
 from app.config import Settings
 from app.db import Database
 from app.parsing import replace_phones
@@ -44,7 +45,9 @@ async def on_take(cb: CallbackQuery, db: Database, settings: Settings, notifier:
         await cb.answer(f"Заявка №{lead_id} удалена клиентом", show_alert=True)
         # Убираем «Взял» этой заявки и ссылку на клиента; кнопки других заявок (в сводке) остаются.
         rest = _without_take(cb.message.reply_markup, lead_id)
-        rows = [[b for b in row if not b.url] for row in rest.inline_keyboard] if rest else []
+        # И ссылку на клиента, и «Ответить через бота» этой заявки: писать больше некому.
+        rows = [[b for b in row if not b.url and b.callback_data != f"reply:{lead_id}"]
+                for row in rest.inline_keyboard] if rest else []
         rows = [row for row in rows if row]
         await cb.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None)
         return
@@ -114,7 +117,10 @@ def create_manager_router() -> Router:
     r.message.register(on_migrate, F.migrate_to_chat_id)
     r.callback_query.register(on_take, F.data.startswith("take:"))
     r.callback_query.register(on_stage_button, F.data.startswith("st:"))
+    r.callback_query.register(on_reply_button, F.data.startswith("reply:"))
     r.message.register(on_status, Command("status"))
     r.message.register(on_report, Command("report"))
+    # Ответ на подсказку «ответьте клиенту» — клиенту; остальное — on_group_message (SkipHandler).
+    r.message.register(on_manager_reply, F.chat.type.in_({"group", "supergroup"}), F.reply_to_message)
     r.message.register(on_group_message, F.chat.type.in_({"group", "supergroup"}))
     return r

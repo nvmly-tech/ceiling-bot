@@ -38,7 +38,9 @@ async def press(env: Env, data: str, user=None) -> None:
 
 
 def buttons(markup) -> list[str]:
-    return [b.callback_data for row in markup.inline_keyboard for b in row] if markup else []
+    """Кнопки этапов (st:…); «Ответить через бота» — в tests/test_relay.py."""
+    return [b.callback_data for row in markup.inline_keyboard for b in row
+            if (b.callback_data or "").startswith("st:")] if markup else []
 
 
 def last_markup(env: Env):

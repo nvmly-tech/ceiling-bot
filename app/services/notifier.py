@@ -47,6 +47,7 @@ from app.services.inwork import (
     nudge_text,
     parse_ts,
     span,
+    talking_to_manager,
     visit_text,
 )
 from app.services.llm import LLMError
@@ -174,11 +175,21 @@ def chat_button(lead: Lead) -> InlineKeyboardButton | None:
     return None
 
 
+def reply_button(lead: Lead) -> InlineKeyboardButton:
+    """Ответ клиенту через бота (app/bot/relay.py) — работает и без @username клиента."""
+    return InlineKeyboardButton(text="💬 Ответить через бота", callback_data=f"reply:{lead.id}")
+
+
 def lead_keyboard(lead: Lead) -> InlineKeyboardMarkup:
     row = [take_button(lead)]
     if chat := chat_button(lead):
         row.append(chat)
-    return InlineKeyboardMarkup(inline_keyboard=[row])
+    return InlineKeyboardMarkup(inline_keyboard=[row, [reply_button(lead)]])
+
+
+def panel_keyboard(lead: Lead) -> InlineKeyboardMarkup:
+    """Панель заявки: кнопки этапов и «Ответить через бота»."""
+    return InlineKeyboardMarkup(inline_keyboard=[*stage_keyboard(lead).inline_keyboard, [reply_button(lead)]])
 
 
 def digest_keyboard(leads: list[Lead]) -> InlineKeyboardMarkup:
@@ -369,7 +380,7 @@ class Notifier:
         lead = await self.db.get_lead(task.lead_id)
         if lead is None or lead.status == "deleted" or not lead.taken_at:
             return
-        await self._send(panel_text(lead, self.settings.zone), stage_keyboard(lead), lead_ids=[lead.id], kind="panel",
+        await self._send(panel_text(lead, self.settings.zone), panel_keyboard(lead), lead_ids=[lead.id], kind="panel",
                          reply_to=task.payload.get("reply_to"))
 
     async def send_nudge(self, task: OutboxTask) -> None:
@@ -438,7 +449,8 @@ class Notifier:
         msgs = [m for m in msgs if m.kind not in ANSWER_KINDS]  # они уже ушли отдельными уведомлениями
         if not msgs:
             return
-        lines = [f"💬 <b>№{lead.id} · {escape(lead.name or 'Клиент')} дописал(а) после анкеты:</b>", ""]
+        said = "ответил(а)" if talking_to_manager(lead) else "дописал(а) после анкеты"
+        lines = [f"💬 <b>№{lead.id} · {escape(lead.name or 'Клиент')} {said}:</b>", ""]
         labels = {"voice": "🎤", "photo": "📷 фото", "document": "📎 файл", "video_note": "📹 видео", "contact": "📱"}
         total = 0
         for i, m in enumerate(msgs):
@@ -458,7 +470,7 @@ class Notifier:
             lines.append(f"\nВ работе у {escape(lead.taken_by_name)}")
         if lead.trello_card_url:
             lines.append(f'📋 <a href="{escape(lead.trello_card_url)}">Карточка в Trello</a>')
-        markup = None if lead.taken_at else lead_keyboard(lead)
+        markup = InlineKeyboardMarkup(inline_keyboard=[[reply_button(lead)]]) if lead.taken_at else lead_keyboard(lead)
         await self._send("\n".join(lines), markup, lead_ids=[lead.id], kind="client")
         await self.db.update_lead(lead.id, client_msgs_notified=msgs[-1].id)
 

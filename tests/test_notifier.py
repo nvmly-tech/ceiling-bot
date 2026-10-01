@@ -149,7 +149,8 @@ async def test_take_moves_card_and_edits_message(env: Env):
     assert lead.taken_by_name == "Иван Менеджеров" and lead.taken_at
     [edit] = env.session.edits()[-1:]
     assert "✅ №1 взял(а): <b>Иван Менеджеров</b>" in edit.text
-    assert [b.url for row in edit.reply_markup.inline_keyboard for b in row] == ["https://t.me/anna"]
+    assert [b.url for row in edit.reply_markup.inline_keyboard for b in row if b.url] == ["https://t.me/anna"]
+    assert "take:1" not in [b.callback_data for row in edit.reply_markup.inline_keyboard for b in row]
 
     await env.tick()
     card = env.trello.cards["C1"]
