@@ -103,7 +103,7 @@ Telegram-бот первичного контакта для студии нат
 
 ## Лимиты и защита
 
-Константы — в начале `app/bot/handlers.py`.
+Константы — в начале `app/bot/handlers.py` (LLM, заявки в сутки) и `app/bot/dialog.py` (флуд, длина голосовых).
 
 - **Флуд:** больше 20 сообщений в минуту или 300 в сутки по одной заявке — лишние не сохраняются и никуда
   не уходят (ни в Trello, ни в Groq), клиент раз в час получает предупреждение (`FLOOD_PER_MIN`, `FLOOD_PER_DAY`).
@@ -329,13 +329,16 @@ uvx ruff check app tests deploy
 
 ## Структура
 
-- `app/bot/handlers.py` — диалог; `texts.py` — все тексты; `keyboards.py`, `states.py`
+- `app/bot/handlers.py` — анкета и ответы через LLM; `dialog.py` — общее для диалога (входящее, переписка,
+  вопросы); `order.py` — `/order`: просмотр, правка и удаление заявки клиентом; `texts.py` — все тексты;
+  `keyboards.py`, `states.py`
 - `app/bot/storage.py` — FSM в SQLite (переживает рестарт)
 - `app/db.py` — лиды, переписка, outbox, FSM; `app/schema.py` — таблицы и миграции
 - `app/services/trello.py` — клиент Trello, оформление карточки, синхронизация
 - `app/services/outbox.py` — воркеры очереди по каналам, с ретраями
 - `app/services/notifier.py` — уведомления, напоминания, дайджест, брошенные анкеты
-- `app/bot/manager.py` — кнопка «Взял в работу» в группе менеджеров
+- `app/bot/manager.py` — кнопка «Взял в работу», `/status`, `/report` в группе менеджеров;
+  `outcomes.py` — кнопки этапов заявки; `followup.py` — ответы клиента на вопросы бота после анкеты
 - `app/services/stt.py` — расшифровка голосовых (GigaAM → Groq), отложенная и теневая расшифровка из очереди
 - `deploy/stt/` — сервис GigaAM: обработчик, юниты, подготовка модели, установка; `app/ops/stt_compare.py` — отчёт
 - `app/services/tgfiles.py` — скачивание файлов из Telegram

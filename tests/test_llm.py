@@ -9,7 +9,7 @@ from aiogram import Bot
 
 from app.bot import texts
 from app.bot.assistant import LeadAssistant, parse_summary, parse_turn
-from app.bot.handlers import SCRIPT
+from app.bot.dialog import SCRIPT
 from app.config import Settings
 from app.db import TG_CLIENT_MSG, Database
 from app.main import build_dispatcher

@@ -11,7 +11,7 @@ from aiogram.methods import GetFile
 from aiogram.types import CallbackQuery, File, InaccessibleMessage
 
 from app import redact
-from app.bot import handlers, texts
+from app.bot import dialog, texts
 from app.bot.assistant import PHONE_MASK, LeadAssistant, mask_phones
 from app.config import Settings
 from app.db import STT_TRANSCRIBE, TG_CLIENT_MSG
@@ -216,7 +216,7 @@ async def test_message_flood_is_not_stored(db):
     for i in range(30):
         await client.text(f"спам {i}")
     stored = [m for m in await db.get_messages(lead.id) if m.direction == "in"]
-    assert len(stored) == handlers.FLOOD_PER_MIN
+    assert len(stored) == dialog.FLOOD_PER_MIN
     sent = [m.text for m in client.session.sent(CHAT.id)]
     assert sent.count(texts.FLOOD) == 1
 

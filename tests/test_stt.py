@@ -8,7 +8,7 @@ import respx
 from aiogram import Bot
 from aiogram.methods import SendChatAction
 
-from app.bot import handlers, texts
+from app.bot import dialog, texts
 from app.config import Settings
 from app.db import STT_TRANSCRIBE, Database
 from app.main import build_dispatcher
@@ -130,7 +130,7 @@ async def test_voice_first_message_starts_dialog(db):
 
 
 async def test_slow_groq_falls_back_to_queue(db, monkeypatch):
-    monkeypatch.setattr(handlers, "STT_TIMEOUT", 0.05)
+    monkeypatch.setattr(dialog, "STT_TIMEOUT", 0.05)
     env = Env(db, FakeTranscriber("около 30", "около 30", delay=0.2))
     await env.to_area()
     await env.client.voice("voice-slow")
@@ -353,7 +353,7 @@ async def test_groq_takes_over_when_gigaam_fails(db):
 
 
 async def test_slow_gigaam_leaves_time_for_groq(db, monkeypatch):
-    monkeypatch.setattr(handlers, "STT_TIMEOUT", 0.3)
+    monkeypatch.setattr(dialog, "STT_TIMEOUT", 0.3)
     giga, groq = two_models()
     giga.delay = 1.0  # дольше своей доли (0.7 × 0.3 с) — клиент не ждёт, отвечает Groq
     env = Env(db, [giga, groq])
