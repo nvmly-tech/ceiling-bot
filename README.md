@@ -292,6 +292,9 @@ uvx ruff check app tests deploy
 Тесты не ходят в сеть (Telegram, Trello, Groq, LLM подменены) и не читают `.env` — все настройки задаются
 в самих тестах. `tests/test_security.py` — регрессия по проверке безопасности, `tests/test_main.py` — сборка бота.
 
+На GitHub те же проверки запускает CI (`.github/workflows/ci.yml`) на каждый push и pull request; Dependabot
+раз в неделю предлагает обновления зависимостей (`uv.lock`) и действий CI.
+
 ## Установка на новый сервер
 
 Нужен сервер с Linux на systemd (проверено на Ubuntu) и вход по SSH под root по ключу.

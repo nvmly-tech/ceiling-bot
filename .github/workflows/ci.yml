@@ -1,0 +1,35 @@
+# Проверки на каждый push и pull request — те же, что deploy.sh делает перед выкладкой:
+# линтер, тесты и порог покрытия из pyproject.toml.
+# Действия закреплены по хешу коммита (рядом — версия): подмена тега в чужом репозитории не изменит
+# то, что здесь запускается. Обновления предлагает Dependabot (.github/dependabot.yml).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Зависимости
+        run: uv sync --frozen
+      - name: Линтер
+        run: uvx ruff check app tests deploy
+      - name: Тесты и покрытие
+        run: uv run pytest -q --cov
