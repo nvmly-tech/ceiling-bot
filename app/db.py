@@ -8,16 +8,17 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Collection, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import aiosqlite
 
 from app.schema import BACKFILL, MIGRATIONS, SCHEMA
 from app.stages import MEASURE
 
+T = TypeVar("T")
 HISTORY_LIMIT = 50  # сколько прошлых заявок клиента читаем (показываем — несколько последних)
 
 # Поля анкеты: их изменение обновляет карточку в Trello.
@@ -453,7 +454,7 @@ class Database:
 
     async def tg_messages(self, lead_id: int) -> list[TgMessage]:
         async with self.conn.execute("SELECT * FROM tg_messages WHERE lead_id = ? ORDER BY id", (lead_id,)) as cur:
-            return [TgMessage(**dict(r)) for r in await cur.fetchall()]
+            return [_row(TgMessage, r) for r in await cur.fetchall()]
 
     async def tg_message_leads(self, chat_id: int, message_id: int) -> list[int]:
         """Заявки, о которых одно сообщение (сводка)."""
@@ -518,12 +519,12 @@ class Database:
             " AND created_at >= ? ORDER BY id",
             (now_iso(since),),
         ) as cur:
-            return [Message(**dict(r)) for r in await cur.fetchall()]
+            return [_row(Message, r) for r in await cur.fetchall()]
 
     async def get_message(self, message_id: int) -> Message | None:
         async with self.conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,)) as cur:
             row = await cur.fetchone()
-        return Message(**dict(row)) if row else None
+        return _row(Message, row) if row else None
 
     async def get_messages(self, lead_id: int, *, after_id: int = 0, direction: str | None = None) -> list[Message]:
         sql = "SELECT * FROM messages WHERE lead_id = ? AND id > ?"
@@ -533,7 +534,7 @@ class Database:
             params.append(direction)
         async with self.conn.execute(sql + " ORDER BY id", params) as cur:
             rows = await cur.fetchall()
-        return [Message(**dict(r)) for r in rows]
+        return [_row(Message, r) for r in rows]
 
     # --- outbox ---
 
@@ -686,7 +687,14 @@ class Database:
             )
 
 
+def _row(cls: type[T], row: aiosqlite.Row) -> T:
+    """Строка таблицы → dataclass. Колонки, которых класс не знает, пропускаются: после отката кода
+    на прошлую версию в базе остаются колонки, добавленные более новой."""
+    known = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in dict(row).items() if k in known})
+
+
 def _lead(row: aiosqlite.Row) -> Lead:
-    d = dict(row)
-    d["is_night"] = bool(d["is_night"])
-    return Lead(**d)
+    lead = _row(Lead, row)
+    lead.is_night = bool(lead.is_night)
+    return lead

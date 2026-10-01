@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Выкладка сервиса расшифровки GigaAM: модель + установка на сервере.
-#   ./deploy/stt/deploy_stt.sh [host]      (host по умолчанию aezn1)
+#   ./deploy/stt/deploy_stt.sh <host>
 # Код сервиса (worker.py, юниты, install.sh) приносит на сервер обычный deploy.sh — запускать после него.
 # Модель готовится локально и разово (экспорт в ONNX + int8, ~1.6 ГБ памяти), лежит в ~/.cache/ceiling-bot-stt.
 set -euo pipefail
 
-HOST=${1:-aezn1}
+HOST=${1:-}
+[ -n "$HOST" ] || { echo "использование: $0 <host>"; exit 1; }  # адрес — всегда явно
 MODEL=v3_e2e_rnnt
 GIGAAM="gigaam[torch] @ git+https://github.com/salute-developers/GigaAM@7447938"  # тот же, что в install.sh
 HERE=$(cd "$(dirname "$0")" && pwd)

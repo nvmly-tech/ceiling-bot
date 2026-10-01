@@ -54,3 +54,15 @@ async def test_simple_writes_are_committed(db: Database, method: str):
     await db.conn.rollback()  # ничего незафиксированного не осталось
     value = await db.kv_get("k") if method == "kv_set" else (await db.fsm_get("k"))[0]
     assert value == "v"
+
+
+async def test_unknown_columns_from_newer_version_are_ignored(db: Database):
+    """Откат кода без отката базы: в таблицах могут быть колонки, которые добавила более новая версия."""
+    lead = await db.create_lead(tg_user_id=1, chat_id=1, name="А", username=None, is_night=False)
+    msg_id = await db.add_message(lead.id, direction="in", kind="text", text="привет")
+    await db.add_tg_message([lead.id], -5000, 10, "lead")
+    for table in ("leads", "messages", "tg_messages"):
+        await db.conn.execute(f"ALTER TABLE {table} ADD COLUMN from_the_future TEXT DEFAULT 'x'")
+    assert (await db.get_lead(lead.id)).name == "А"
+    assert (await db.get_message(msg_id)).text == "привет"
+    assert [m.message_id for m in await db.tg_messages(lead.id)] == [10]
