@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.config import Settings
-from app.parsing import normalize_phone, parse_area
+from app.parsing import normalize_phone, parse_area, replace_phones
 from app.worktime import is_work_time, manager_eta
 
 
@@ -64,3 +64,48 @@ def test_mask_phones_with_dot_inside_number():
     # Точка в конце предложения не склеивает номер со следующим числом.
     assert mask_phones("номер 8 912 345 67 89. 20 метров") == (f"номер {PHONE_MASK}. 20 метров", ["+79123456789"])
     assert parse_area("номер 8 912 345 67 89. 20 метров") == 20.0
+
+
+# --- телефон, продиктованный словами ---
+
+SPOKEN = "восемь девятьсот двенадцать триста сорок пять шестьдесят семь восемьдесят девять"
+
+
+def phones_in(text: str) -> tuple[list[str], str]:
+    found: list[str] = []
+    rest = replace_phones(text, lambda p: found.append(p) or "[телефон]")
+    return found, rest
+
+
+@pytest.mark.parametrize(("text", "phone"), [
+    (SPOKEN, "+79123456789"),
+    ("Восемь Девятьсот Двенадцать Триста Сорок Пять Шестьдесят Семь Восемьдесят Девять", "+79123456789"),
+    ("плюс семь девятьсот двенадцать триста сорок пять шестьдесят семь восемьдесят девять", "+79123456789"),
+    ("восемь девять один два три четыре пять шесть семь восемь девять", "+79123456789"),  # по цифре
+    ("8 девятьсот 123 45 67", "+79001234567"),  # вперемешку
+    ("девятьсот двенадцать, триста сорок пять — шестьдесят семь, восемьдесят девять", "+79123456789"),
+])
+def test_spoken_phone(text, phone):
+    found, rest = phones_in(text)
+    assert found == [phone] and rest.strip(" ,.—") == "[телефон]"
+
+
+def test_spoken_phone_inside_sentence_keeps_the_rest():
+    found, rest = phones_in(f"мой номер {SPOKEN}, звоните в субботу после обеда")
+    assert found == ["+79123456789"]
+    assert rest == "мой номер [телефон], звоните в субботу после обеда"
+
+
+@pytest.mark.parametrize("text", [
+    "два окна и двадцать пять метров", "сто двадцать квадратов, три комнаты", "в пятницу после пяти",
+    "один два три четыре пять",  # слишком коротко для телефона
+])
+def test_numbers_in_words_are_not_phones(text):
+    assert phones_in(text) == ([], text)
+
+
+def test_spoken_phone_masked_before_llm():
+    from app.bot.assistant import mask_phones
+
+    masked, phones = mask_phones(f"звоните: {SPOKEN}")
+    assert phones == ["+79123456789"] and "девятьсот" not in masked

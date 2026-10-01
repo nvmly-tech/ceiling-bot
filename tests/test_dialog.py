@@ -239,3 +239,16 @@ async def test_cancelled_lead_gets_no_reminders(db):
     assert [x.id for x in await db.leads_waiting()] == [lead.id]
     await db.update_lead(lead.id, status="cancelled")
     assert await db.leads_waiting() == [] and await db.leads_to_notify() == []
+
+
+async def test_phone_dictated_in_words_with_measure_time(client: Client, db):
+    """Номер словами — так его пишут и так его отдаёт расшифровка голосового — и время замера одной фразой."""
+    await client.text("/start")
+    await client.press("obj:flat")
+    await client.text("20")
+    await client.press("ct:matte")
+    await client.text("мой номер восемь девятьсот двенадцать триста сорок пять шестьдесят семь восемьдесят девять, "
+                      "в субботу после обеда")
+    lead = await db.last_lead(USER.id)
+    assert lead.phone == "+79123456789" and lead.measure_time == "в субботу после обеда"
+    assert lead.status == "qualified"
