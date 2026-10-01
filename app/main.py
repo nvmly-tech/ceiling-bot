@@ -39,7 +39,7 @@ log = logging.getLogger("ceiling-bot")
 
 def build_dispatcher(
     db: Database, settings: Settings, notifier: Notifier | None = None, stt: SpeechService | None = None,
-    assistant: LeadAssistant | None = None, monitor: HealthMonitor | None = None,
+    assistant: LeadAssistant | None = None, monitor: HealthMonitor | None = None, facts: StudioFacts | None = None,
 ) -> Dispatcher:
     dp = Dispatcher(storage=SQLiteStorage(db))
     dp["monitor"] = monitor
@@ -48,6 +48,7 @@ def build_dispatcher(
     dp["notifier"] = notifier
     dp["stt"] = stt
     dp["assistant"] = assistant
+    dp["facts"] = facts  # название студии для приветствия — и без LLM
     dp.include_router(create_manager_router())
     dp.include_router(create_followup_router())  # до диалога: его обработчик ловит все остальные кнопки
     dp.include_router(create_router())
@@ -156,7 +157,8 @@ async def build_app(settings: Settings, bot: Bot | None = None, db: Database | N
     trello = build_trello(db, settings, fetch_file)
     stt = build_stt(db, settings, fetch_file)
     llm = build_llm(settings)
-    assistant = LeadAssistant(llm, StudioFacts(settings.facts_path or DEFAULT_FILE)) if llm else None
+    facts = StudioFacts(settings.facts_path or DEFAULT_FILE)
+    assistant = LeadAssistant(llm, facts) if llm else None
     notifier = Notifier(bot, db, settings, trello_enabled=trello is not None, assistant=assistant)
 
     clients = ClientFollowUp(bot, db, settings)
@@ -178,7 +180,7 @@ async def build_app(settings: Settings, bot: Bot | None = None, db: Database | N
     )
     bot.session.middleware(monitor.session_middleware)
     bot.session.middleware(ChatRateLimiter().middleware)  # не больше 18 сообщений в минуту в каждую группу
-    dp = build_dispatcher(db, settings, notifier, stt, assistant, monitor)
+    dp = build_dispatcher(db, settings, notifier, stt, assistant, monitor, facts)
     return App(bot, db, dp, outbox, notifier, monitor, trello, stt, llm)
 
 

@@ -18,6 +18,9 @@ log = logging.getLogger(__name__)
 
 DEFAULT_FILE = Path(__file__).resolve().parents[2] / "facts.md"
 _COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)  # служебные пометки для студии — в промпт не идут
+# Название студии для приветствия: строка «- Название: Потолки Мастер» (владелец пишет её сам).
+_NAME = re.compile(r"^\s*-\s*название\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
+NAME_MAX = 60
 # Сумма в рублях: «500 ₽», «1 700 ₽», «≈ 34 000 руб.» (пробелы внутри числа — любые).
 _RUBLES = re.compile(r"(\d[\d\s  ]*)\s*(?:₽|руб)")
 
@@ -60,6 +63,13 @@ def rubles(text: str) -> set[int]:
     return {int(re.sub(r"\D", "", m.group(1))) for m in _RUBLES.finditer(text)}
 
 
+def studio_name(text: str) -> str | None:
+    match = _NAME.search(text)
+    if not match:
+        return None
+    return match.group(1).strip().strip("«»\"'“”").strip()[:NAME_MAX] or None
+
+
 def _read(path: Path) -> str:
     text = _COMMENT.sub("", path.read_text(encoding="utf-8")).strip()
     if not text:
@@ -81,6 +91,7 @@ class StudioFacts:
 
     def _set(self, text: str) -> None:
         self._text, self._amounts, self._vocab = text, frozenset(rubles(text)), ceiling_vocab(text)
+        self._name = studio_name(text)
 
     def _report(self, problem: str) -> None:
         # На старте прежней версии нет — об этом отдельное предупреждение в __init__ (переход на образец).
@@ -115,6 +126,12 @@ class StudioFacts:
     def allowed_amounts(self) -> frozenset[int]:
         self.refresh()
         return self._amounts
+
+    @property
+    def name(self) -> str | None:
+        """Название студии из строки «- Название: …»; None — строки нет (приветствие без названия)."""
+        self.refresh()
+        return self._name
 
     @property
     def ceiling_types(self) -> CeilingVocab:

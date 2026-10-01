@@ -1,6 +1,7 @@
 """Факты о студии в файле (facts.md): правка без программиста, подхват без перезапуска."""
 
 import os
+from datetime import time
 
 import pytest
 
@@ -75,3 +76,50 @@ async def test_assistant_uses_its_facts_file(tmp_path):
                 created_at="", updated_at="", completed_at=None)
     result = await assistant.dialog_turn(lead, [], "сколько стоит?", done=False, eta="завтра")
     assert result.reply.startswith("Матовый — от 610") and "от 610 ₽/м²" in ds.calls[0][0]["content"]
+
+
+# --- название студии для приветствия ---
+
+
+@pytest.mark.parametrize(("line", "name"), [
+    ("- Название: Потолки Мастер", "Потолки Мастер"),
+    ("- название : «Потолки Мастер»", "Потолки Мастер"),
+    ('- Название: "Небо"', "Небо"),
+    ("- Название: " + "Я" * 100, "Я" * 60),
+    ("- Студия делает потолки.", None),
+])
+def test_studio_name_from_facts(tmp_path, line, name):
+    path = tmp_path / "facts.md"
+    path.write_text(f"- Замер бесплатный.\n{line}\n", encoding="utf-8")
+    assert StudioFacts(path).name == name
+
+
+def test_studio_name_in_comment_is_ignored(tmp_path):
+    path = tmp_path / "facts.md"
+    path.write_text("<!--\n- Название: Пример из пометок\n-->\n- Замер бесплатный.\n", encoding="utf-8")
+    assert StudioFacts(path).name is None
+
+
+async def test_greeting_uses_studio_name_and_picks_up_edits(db, tmp_path):
+    from aiogram import Bot
+
+    from app.config import Settings
+    from app.main import build_dispatcher
+    from tests.conftest import Client, FakeSession
+
+    path = tmp_path / "facts.md"
+    path.write_text("- Замер бесплатный.\n", encoding="utf-8")
+    facts = StudioFacts(path)
+    settings = Settings(bot_token="1:T", work_start=time(0), work_end=time(23, 59, 59))
+    session = FakeSession()
+    client = Client(build_dispatcher(db, settings, facts=facts), Bot("1:T", session=session), session)
+
+    await client.text("/start")
+    greeting = session.sent()[0].text
+    assert "Это студия натяжных потолков." in greeting  # без названия — как раньше
+
+    path.write_text("- Замер бесплатный.\n- Название: Потолки Мастер\n", encoding="utf-8")
+    os.utime(path, ns=(path.stat().st_mtime_ns + 10**9,) * 2)  # правка файла владельцем — без перезапуска
+    await client.text("/start")
+    await client.press("restart:new:1")
+    assert any("студия натяжных потолков «Потолки Мастер»" in m.text for m in session.sent())

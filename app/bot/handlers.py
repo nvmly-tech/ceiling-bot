@@ -39,6 +39,7 @@ from app.bot.dialog import (
     receive_middleware,
     say,
 )
+from app.bot.facts import StudioFacts
 from app.bot.order import leave_edit, on_delete_button, on_edit_button, on_edit_choice, on_edit_text, on_order
 from app.bot.states import EDITS, QUESTIONS, EditLead, Lead
 from app.config import Settings
@@ -117,12 +118,19 @@ def start_source(command: CommandObject | None) -> str | None:
     return arg.lower() if _SOURCE.fullmatch(arg) else None
 
 
+def studio_title(facts: StudioFacts | None) -> str:
+    """Как студия представляется в приветствии: с названием из facts.md, если оно там есть."""
+    name = facts.name if facts else None
+    return texts.STUDIO_NAMED.format(name=name) if name else texts.STUDIO
+
+
 async def start_lead(
     message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming,
     assistant: LeadAssistant | None = None, *, user: User | None = None, source: str | None = None,
+    facts: StudioFacts | None = None,
 ) -> int:
     """Новая заявка. user — клиент, если message — не его сообщение (кнопка под сообщением бота);
-    source — метка источника из ссылки, по которой клиент пришёл."""
+    source — метка источника из ссылки, по которой клиент пришёл; facts — откуда взять название студии."""
     user = user or message.from_user
     if await db.count_leads_since(user.id, datetime.now(UTC) - timedelta(days=1)) >= LEADS_PER_DAY:
         # Кто-то жмёт /start по кругу — не плодим карточки и уведомления, продолжаем последнюю заявку.
@@ -141,10 +149,11 @@ async def start_lead(
     await state.set_state(Lead.object)
     await state.set_data({"lead_id": lead.id})
     await log_in(db, lead.id, item)
+    studio = studio_title(facts)
     greeting = (
-        texts.GREETING_NIGHT.format(name=user.first_name, eta=manager_eta(now, settings))
+        texts.GREETING_NIGHT.format(name=user.first_name, studio=studio, eta=manager_eta(now, settings))
         if night
-        else texts.GREETING_DAY.format(name=user.first_name)
+        else texts.GREETING_DAY.format(name=user.first_name, studio=studio)
     )
     await say(message, db, lead.id, greeting)
     # Клиент сразу что-то написал (не /start) — пусть LLM ответит на это и спросит недостающее.
@@ -159,7 +168,7 @@ async def start_lead(
 
 async def on_start(
     message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming,
-    assistant: LeadAssistant | None = None, command: CommandObject | None = None,
+    assistant: LeadAssistant | None = None, command: CommandObject | None = None, facts: StudioFacts | None = None,
 ) -> None:
     current = await leave_edit(state)
     lead_id = (await state.get_data()).get("lead_id")
@@ -170,11 +179,12 @@ async def on_start(
         await log_in(db, lead_id, item)
         await say(message, db, lead_id, texts.RESTART_CHOICE.format(lead_id=lead_id), keyboards.restart(lead_id))
         return
-    await start_lead(message, state, db, settings, item, assistant, source=source)
+    await start_lead(message, state, db, settings, item, assistant, source=source, facts=facts)
 
 
 async def on_restart_button(
     cb: CallbackQuery, state: FSMContext, db: Database, settings: Settings, assistant: LeadAssistant | None = None,
+    facts: StudioFacts | None = None,
 ) -> None:
     _, action, raw_id = (cb.data.split(":") + ["", ""])[:3]
     current = await state.get_state()
@@ -203,7 +213,7 @@ async def on_restart_button(
     await db.update_lead(lead_id, status="cancelled")
     await say(cb.message, db, lead_id, texts.RESTART_CLOSED.format(lead_id=lead_id))
     await start_lead(cb.message, state, db, settings, Incoming("button", label), assistant, user=cb.from_user,
-                     source=data.get("start_source"))
+                     source=data.get("start_source"), facts=facts)
 
 
 # --- ответы через LLM ---
@@ -376,9 +386,9 @@ async def on_after_done(message: Message, state: FSMContext, db: Database, setti
 
 async def on_first_message(
     message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming,
-    assistant: LeadAssistant | None = None,
+    assistant: LeadAssistant | None = None, facts: StudioFacts | None = None,
 ) -> None:
-    await start_lead(message, state, db, settings, item, assistant)
+    await start_lead(message, state, db, settings, item, assistant, facts=facts)
 
 
 # --- фото/стикеры/документы посреди анкеты ---
