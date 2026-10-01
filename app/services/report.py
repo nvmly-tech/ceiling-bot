@@ -12,9 +12,10 @@ from statistics import median
 
 from app.config import Settings
 from app.db import TG_REPORT, Database, Lead, OutboxTask, now_iso
-from app.services.notifier import HOT_ICONS, LOW_RATING, RATING_MAX, Notifier, next_work_start
+from app.services.inwork import LOW_RATING, RATING_MAX
+from app.services.notifier import HOT_ICONS, Notifier
 from app.stages import CONTRACT, MEASURE, NO_ANSWER, REFUSE_REASONS, REFUSED, STAGE_ICONS, THINKING
-from app.worktime import is_work_time
+from app.worktime import is_work_time, next_work_start
 
 KV_LAST_REPORT = "last_report_week"  # понедельник недели, в которую отчёт уже отправлен (или бот впервые запущен)
 REPORT_DAYS_DEFAULT = 7

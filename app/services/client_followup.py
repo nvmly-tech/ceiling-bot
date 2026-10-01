@@ -16,9 +16,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from app.bot import texts
 from app.config import Settings
 from app.db import TG_TO_CLIENT, Database, Lead, OutboxTask, now_iso
-from app.services.notifier import next_work_start
 from app.stages import MEASURE, REFUSED, stamp, when_text
-from app.worktime import is_work_time
+from app.worktime import is_work_time, next_work_start
 
 log = logging.getLogger(__name__)
 
