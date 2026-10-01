@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     llm_primary_model: str | None = None
     llm_fallback_model: str = "openai/gpt-oss-120b"
     llm_timeout_sec: float = 15
+    # Общий лимит обращений к LLM в сутки (по часовому поясу студии) — на все заявки и резюме: поток фейковых
+    # аккаунтов не должен стоить студии денег. Исчерпан — до полуночи анкету ведёт скрипт, админу — алерт.
+    # 0 — без лимита.
+    llm_calls_per_day: int = 2000
 
     # Куда слать алерты сторожа; пусто — в чат менеджеров.
     admin_chat_id: int | None = None

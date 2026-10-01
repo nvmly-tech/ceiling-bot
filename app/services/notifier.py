@@ -330,6 +330,10 @@ class Notifier:
         """Резюме и «горячесть» для текущего статуса лида. Не вышло — уведомление уйдёт без резюме."""
         if self.assistant is None or lead.summary_status == lead.status:
             return lead
+        day = datetime.now(self.settings.zone).date().isoformat()
+        if not await self.db.spend_llm_day(self.settings.llm_calls_per_day, day):
+            log.warning("Резюме лида %s не запрошено: дневной лимит обращений к LLM исчерпан", lead.id)
+            return lead
         try:
             s = await asyncio.wait_for(
                 self.assistant.summarize(lead, await self.db.get_messages(lead.id)), SUMMARY_BUDGET

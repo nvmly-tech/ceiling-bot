@@ -40,6 +40,7 @@ STT_FAIL_THRESHOLD = 2
 QUEUE_STUCK_AFTER = timedelta(minutes=30)
 STT_COMPARE_WINDOW = timedelta(days=14)  # за сколько дней /status сравнивает основную и теневую расшифровку
 KV_RUNNING = "running"     # 1 — процесс работает; остался 1 при старте — прошлый запуск умер аварийно
+KV_LLM_ALERTED = "llm_day_alerted"  # дата, за которую уже сообщили об исчерпанном дневном лимите LLM
 
 REVISION_FILE = Path(__file__).resolve().parents[2] / "REVISION"
 
@@ -245,6 +246,22 @@ class HealthMonitor:
                         self.llm.record_ok(p.label)
         for t in self.stt:
             await self._check_stt(t)
+        await self._check_llm_budget()
+
+    async def _check_llm_budget(self) -> None:
+        """Дневной лимит обращений к LLM исчерпан — один алерт за день: дальше анкету ведёт скрипт."""
+        limit = self.settings.llm_calls_per_day
+        if not self.llm or not limit:
+            return
+        day = self.clock().astimezone(self.settings.zone).date().isoformat()
+        if await self.db.llm_calls_on(day) < limit or await self.db.kv_get(KV_LLM_ALERTED) == day:
+            return
+        await self.db.kv_set(KV_LLM_ALERTED, day)
+        await self.alerter.send(
+            f"🛑 Дневной лимит обращений к LLM ({limit}) исчерпан — до полуночи анкету ведёт скрипт.\n"
+            "Если заявок столько не было — похоже на поток фейковых аккаунтов: проверьте группу и Trello. "
+            "Лимит — LLM_CALLS_PER_DAY."
+        )
 
     async def _check_stt(self, t: Transcriber) -> None:
         label = model_label(t)
@@ -351,6 +368,9 @@ class HealthMonitor:
                     lines.append(f"⚠️ {escape(p.label)} — ошибок подряд: {h.failures}")
                 else:
                     lines.append(f"✅ {escape(p.label)} — {llm_activity(h, now)}")
+            used = await self.db.llm_calls_on(now.astimezone(self.settings.zone).date().isoformat())
+            limit = self.settings.llm_calls_per_day
+            lines.append(f"LLM за сегодня: {used} из {limit} обращений" if limit else f"LLM за сегодня: {used}")
         else:
             lines.append("LLM: не настроена — анкета по скрипту")
         if self.stt:

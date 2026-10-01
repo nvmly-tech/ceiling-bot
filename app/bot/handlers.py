@@ -66,8 +66,9 @@ async def llm_turn(
     тогда в базе ничего не изменено, кроме счётчика обращений."""
     data = await state.get_data()
     lead_id = data["lead_id"]
-    if not await db.spend_llm_call(lead_id, LLM_CALLS_MAX):
-        return False  # лимит обращений к LLM на заявку исчерпан — дальше скрипт
+    day = local_now(settings.zone).date().isoformat()
+    if not await db.spend_llm_call(lead_id, LLM_CALLS_MAX, day_limit=settings.llm_calls_per_day, day=day):
+        return False  # лимит обращений к LLM на заявку или на день исчерпан — дальше скрипт
     current = await state.get_state()
     done = current == Lead.done.state
     lead = await db.get_lead(lead_id)

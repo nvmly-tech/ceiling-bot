@@ -19,6 +19,11 @@ from app.schema import BACKFILL, MIGRATIONS, SCHEMA
 from app.stages import MEASURE
 
 T = TypeVar("T")
+LLM_DAY_KEY = "llm_calls:{day}"  # kv: обращений к LLM за день (по часовому поясу студии)
+
+
+class _NoBudget(Exception):
+    """Обращение к LLM не списано (лимит заявки или дня исчерпан) — откатить транзакцию."""
 HISTORY_LIMIT = 50  # сколько прошлых заявок клиента читаем (показываем — несколько последних)
 
 # Поля анкеты: их изменение обновляет карточку в Trello.
@@ -320,14 +325,36 @@ class Database:
         ) as cur:
             return (await cur.fetchone())[0]
 
-    async def spend_llm_call(self, lead_id: int, limit: int) -> bool:
-        """Списать одно обращение к LLM из бюджета заявки. False — бюджет исчерпан.
-        Счётчик в базе, а не в FSM: сброс состояния диалога (/start) его не обнуляет."""
+    async def spend_llm_call(self, lead_id: int, limit: int, *, day_limit: int = 0, day: str = "") -> bool:
+        """Списать одно обращение к LLM: из бюджета заявки (limit) и общего бюджета дня (day_limit, 0 — без
+        лимита; day — дата по часовому поясу студии). False — один из них исчерпан, не списано ничего.
+        Счётчик заявки в базе, а не в FSM: сброс состояния диалога (/start) его не обнуляет."""
+        try:
+            async with self._tx():
+                cur = await self.conn.execute(
+                    "UPDATE leads SET llm_calls = llm_calls + 1 WHERE id = ? AND llm_calls < ?", (lead_id, limit)
+                )
+                if cur.rowcount == 0 or (day and not await self._spend_day(day_limit, day)):
+                    raise _NoBudget
+        except _NoBudget:
+            return False
+        return True
+
+    async def spend_llm_day(self, limit: int, day: str) -> bool:
+        """Списать обращение к LLM только из бюджета дня (резюме лида). False — день исчерпан."""
         async with self._tx():
-            cur = await self.conn.execute(
-                "UPDATE leads SET llm_calls = llm_calls + 1 WHERE id = ? AND llm_calls < ?", (lead_id, limit)
-            )
+            return await self._spend_day(limit, day)
+
+    async def _spend_day(self, limit: int, day: str) -> bool:
+        cur = await self.conn.execute(
+            "INSERT INTO kv (key, value) VALUES (?, '1') ON CONFLICT(key) DO UPDATE"
+            " SET value = CAST(value AS INTEGER) + 1 WHERE ? = 0 OR CAST(kv.value AS INTEGER) < ?",
+            (LLM_DAY_KEY.format(day=day), limit, limit),
+        )
         return cur.rowcount == 1
+
+    async def llm_calls_on(self, day: str) -> int:
+        return int(await self.kv_get(LLM_DAY_KEY.format(day=day)) or 0)
 
     async def _leads(self, where: str, params: Sequence[Any] = ()) -> list[Lead]:
         async with self.conn.execute(f"SELECT * FROM leads WHERE {where} ORDER BY id", params) as cur:
