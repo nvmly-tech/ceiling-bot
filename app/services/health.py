@@ -8,7 +8,6 @@ Watchdog (WATCHDOG=1) шлётся, только если живо ядро бо
 
 import asyncio
 import logging
-import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -184,13 +183,17 @@ class HealthMonitor:
         if interval is None:
             log.info("Watchdog systemd не включён (запуск не под systemd)")
             return
-        last_ping = 0.0
+        last_ping: datetime | None = None  # пинга ещё не было — первый сразу, как ядро здорово
         while True:
             report = await self.check()
             if report.ok:
                 systemd.notify("WATCHDOG=1")
-                if self.settings.healthcheck_url and time.monotonic() - last_ping > MODEL_CHECK_INTERVAL:
-                    last_ping = time.monotonic()
+                # Не time.monotonic(): он считает от загрузки машины, и сразу после перезагрузки сервера
+                # «0 — давно» оказывалось меньше интервала — первый пинг откладывался (поймал CI на свежем раннере).
+                now = self.clock()
+                due = last_ping is None or (now - last_ping).total_seconds() > MODEL_CHECK_INTERVAL
+                if self.settings.healthcheck_url and due:
+                    last_ping = now
                     await self._ping_healthcheck()
             else:
                 # Не пингуем — systemd перезапустит процесс, когда истечёт WatchdogSec.
