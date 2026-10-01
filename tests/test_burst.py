@@ -15,11 +15,13 @@ WORK = dict(work_start=time(9), work_end=time(21))
 
 
 def at(days: int, hour: int, minute: int = 0) -> datetime:
+    """Момент в часовом поясе студии. Утро в тестах — завтрашнее: задачи очереди ставятся по настоящим часам,
+    и «сегодня 9:15», уже прошедшее к запуску тестов, сделало бы их «запланированными на потом»."""
     day = datetime.now(ZONE).date() + timedelta(days=days)
     return datetime.combine(day, time(hour, minute), tzinfo=ZONE).astimezone(UTC)
 
 
-async def night_leads(db: Database, n: int, *, night_of: int = -1) -> list[int]:
+async def night_leads(db: Database, n: int, *, night_of: int = 0) -> list[int]:
     """n заявок, о которых менеджеров уведомили ночью (в 23:00 дня night_of), никто не взял."""
     ids = []
     for i in range(n):
@@ -42,7 +44,7 @@ def buttons(msg) -> list[str]:
 
 async def test_morning_reminders_go_as_one_list(env: Env):
     ids = await night_leads(env.db, 40)
-    for moment in (at(0, 9, 0), at(0, 9, 15, ), at(0, 9, 30), at(0, 9, 45), at(0, 10, 5)):
+    for moment in (at(1, 9, 0), at(1, 9, 15, ), at(1, 9, 30), at(1, 9, 45), at(1, 10, 5)):
         await env.tick(moment + timedelta(seconds=30))
     group = env.session.sent(GROUP)
     lists = [m for m in group if m.text.startswith("⏰")]
@@ -58,16 +60,16 @@ async def test_morning_reminders_go_as_one_list(env: Env):
 
 async def test_single_due_reminder_stays_personal(env: Env):
     await night_leads(env.db, 1)
-    await env.tick(at(0, 9, 0))
-    await env.tick(at(0, 9, 15, ) + timedelta(seconds=30))
+    await env.tick(at(1, 9, 0))
+    await env.tick(at(1, 9, 15, ) + timedelta(seconds=30))
     [reminder] = [m for m in env.session.sent(GROUP) if m.text.startswith("⏰")]
     assert "Заявку №1 никто не взял" in reminder.text
 
 
 async def test_digest_lists_only_last_night_and_is_capped(env: Env):
-    old = await night_leads(env.db, 3, night_of=-3)  # позавчерашние: уже были в прошлых сводках
+    old = await night_leads(env.db, 3, night_of=-2)  # трое суток назад: уже были в прошлых сводках
     fresh = await night_leads(env.db, LIST_MAX + 5)
-    await env.tick(at(0, 9, 0) + timedelta(seconds=30))
+    await env.tick(at(1, 9, 0) + timedelta(seconds=30))
     [digest] = [m for m in env.session.sent(GROUP) if m.text.startswith("☀️")]
     assert f"Ночных заявок ждут менеджера: {len(fresh)}" in digest.text
     assert all(f"№{i} " not in digest.text for i in old)
@@ -76,10 +78,10 @@ async def test_digest_lists_only_last_night_and_is_capped(env: Env):
 
 async def test_list_rebuilt_without_deleted_lead(env: Env):
     a, b = await night_leads(env.db, 2)
-    await env.tick(at(0, 9, 0))
-    await env.tick(at(0, 9, 15) + timedelta(seconds=30))
+    await env.tick(at(1, 9, 0))
+    await env.tick(at(1, 9, 15) + timedelta(seconds=30))
     await env.db.delete_lead_data(a)
-    await env.tick(at(0, 9, 16))
+    await env.tick(at(1, 9, 16))
     rebuilt = [e for e in env.session.edits() if e.text.startswith("⏰")]
     assert rebuilt and "Заявки ждут менеджера: 1" in rebuilt[-1].text and f"№{b}" in rebuilt[-1].text
     assert buttons(rebuilt[-1]) == [f"take:{b}"]
@@ -87,7 +89,7 @@ async def test_list_rebuilt_without_deleted_lead(env: Env):
 
 async def test_untaken_escalations_batched_to_owner(env: Env):
     await night_leads(env.db, 5)
-    for moment in (at(0, 9, 0), at(0, 9, 15), at(0, 9, 30), at(0, 9, 45), at(0, 10, 0), at(0, 10, 30)):
+    for moment in (at(1, 9, 0), at(1, 9, 15), at(1, 9, 30), at(1, 9, 45), at(1, 10, 0), at(1, 10, 30)):
         await env.tick(moment + timedelta(seconds=30))
     owner = env.session.sent(OWNER)
     assert len(owner) == 1 and "Заявки так никто и не взял: 5" in owner[0].text
@@ -95,7 +97,7 @@ async def test_untaken_escalations_batched_to_owner(env: Env):
 
 async def test_single_untaken_escalation_stays_personal(env: Env):
     await night_leads(env.db, 1)
-    for moment in (at(0, 9, 0), at(0, 9, 15), at(0, 9, 30), at(0, 9, 45), at(0, 10, 0)):
+    for moment in (at(1, 9, 0), at(1, 9, 15), at(1, 9, 30), at(1, 9, 45), at(1, 10, 0)):
         await env.tick(moment + timedelta(seconds=30))
     [owner] = env.session.sent(OWNER)
     assert "Заявка №1" in owner.text and "никто не взял" in owner.text
