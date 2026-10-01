@@ -61,7 +61,7 @@ from app.stages import (
     history_lines,
     stage_text,
 )
-from app.worktime import is_work_time, next_work_start
+from app.worktime import last_work_end, next_work_start, work_time
 
 log = logging.getLogger(__name__)
 
@@ -77,11 +77,10 @@ SUMMARY_BUDGET = 8                  # с
 # Telegram даёт боту удалять свои сообщения только 48 ч; берём с запасом — удаление идёт через очередь.
 TG_DELETE_WINDOW = timedelta(hours=47)
 LIST_MAX = 20                       # заявок в одном списке (сводка, напоминание, эскалация); дальше — «и ещё N»
-DIGEST_WINDOW = timedelta(hours=24)  # в утреннюю сводку — заявки за последние сутки (старые уже были в прошлых)
 # Списки заявок одним сообщением: вид → (заголовок, кнопки «Взял», сколько ждёт). Утром после ночи с заявками
 # напоминания о каждой по отдельности — это десятки сообщений разом, а Telegram пускает в группу 20 в минуту.
 LISTS = {
-    "digest": ("☀️ <b>Доброе утро! Ночных заявок ждут менеджера: {n}</b>", True, False),
+    "digest": ("☀️ <b>Доброе утро! Заявки за нерабочее время ждут менеджера: {n}</b>", True, False),
     "remind_list": ("⏰ <b>Заявки ждут менеджера: {n}</b>", True, True),
     "untaken_list": ("⚠️ <b>Заявки так никто и не взял: {n}</b>", False, True),
 }
@@ -273,7 +272,7 @@ class Notifier:
     def _silent(self) -> bool:
         """Ночью уведомления приходят без звука."""
         now = datetime.now(self.settings.zone)
-        return not is_work_time(now, self.settings.work_start, self.settings.work_end)
+        return not work_time(now, self.settings)
 
     async def _send(
         self, text: str, markup: InlineKeyboardMarkup | None = None, *, lead_ids: Sequence[int] = (), kind: str = "",
@@ -530,7 +529,7 @@ class Notifier:
             )
 
         waiting = await self.db.leads_waiting()
-        work_now = is_work_time(now.astimezone(s.zone), s.work_start, s.work_end)
+        work_now = work_time(now, s)
         if work_now:
             await self._remind([lead for lead in waiting if self._remind_due(lead, now)], now)
             for lead in await self.db.leads_in_work():
@@ -540,7 +539,8 @@ class Notifier:
         today = now.astimezone(s.zone).date().isoformat()
         if work_now and await self.db.kv_get(KV_LAST_DIGEST) != today:
             await self.db.kv_set(KV_LAST_DIGEST, today)
-            night = [lead.id for lead in waiting if lead.is_night and parse_ts(lead.notified_at) >= now - DIGEST_WINDOW]
+            since = last_work_end(now, s)  # после выходных — с конца пятницы, а не «за сутки»
+            night = [lead.id for lead in waiting if lead.is_night and parse_ts(lead.notified_at) >= since]
             if night:
                 await self.db.enqueue(TG_DIGEST, None, {"lead_ids": night})
 

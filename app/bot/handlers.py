@@ -45,7 +45,7 @@ from app.config import Settings
 from app.db import TG_CLIENT_MSG, Database
 from app.parsing import clip, normalize_phone, parse_area, replace_phones
 from app.services.llm import LLMError
-from app.worktime import is_work_time, local_now, manager_eta
+from app.worktime import local_now, manager_eta, work_time
 
 log = logging.getLogger(__name__)
 
@@ -133,7 +133,7 @@ async def start_lead(
         await say(message, db, last.id, texts.LEADS_LIMIT.format(lead_id=last.id), keyboards.remove())
         return last.id
     now = local_now(settings.zone)
-    night = not is_work_time(now, settings.work_start, settings.work_end)
+    night = not work_time(now, settings)
     lead = await db.create_lead(
         tg_user_id=user.id, chat_id=message.chat.id, name=user.full_name, username=user.username, is_night=night,
         source=source,
@@ -142,7 +142,7 @@ async def start_lead(
     await state.set_data({"lead_id": lead.id})
     await log_in(db, lead.id, item)
     greeting = (
-        texts.GREETING_NIGHT.format(name=user.first_name, eta=manager_eta(now, settings.work_start, settings.work_end))
+        texts.GREETING_NIGHT.format(name=user.first_name, eta=manager_eta(now, settings))
         if night
         else texts.GREETING_DAY.format(name=user.first_name)
     )

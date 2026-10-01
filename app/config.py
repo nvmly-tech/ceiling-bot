@@ -1,4 +1,4 @@
-from datetime import time
+from datetime import date, time
 from functools import lru_cache
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -17,10 +17,15 @@ class Settings(BaseSettings):
     bot_token: SecretStr
     db_path: Path = Path("data/ceiling-bot.sqlite3")
 
-    # Рабочие часы студии: вне их клиенту говорим, что менеджер ответит утром.
+    # Рабочие часы студии: вне их клиенту говорим, когда ответит менеджер.
     studio_tz: str = "Europe/Moscow"
     work_start: time = time(9, 0)
     work_end: time = time(21, 0)
+    # Рабочие дни недели (1 — понедельник … 7 — воскресенье): «1-5», «1-6», «1,2,3,5». Нерабочий день — как ночь:
+    # уведомления без звука, без напоминаний, клиенту — «менеджер ответит в понедельник в 9:00».
+    work_days: str = "1-7"
+    # Нерабочие даты через запятую: полные (2026-12-31) или каждый год (01-01).
+    days_off: str = ""
 
     log_level: str = "INFO"
 
@@ -87,6 +92,27 @@ class Settings(BaseSettings):
     def trello_enabled(self) -> bool:
         return bool(self.trello_api_key and self.trello_token and self.trello_board_id)
 
+    @field_validator("work_days")
+    @classmethod
+    def _valid_work_days(cls, value: str) -> str:
+        parse_work_days(value)
+        return value
+
+    @field_validator("days_off")
+    @classmethod
+    def _valid_days_off(cls, value: str) -> str:
+        parse_days_off(value)
+        return value
+
+    @property
+    def workdays(self) -> frozenset[int]:
+        return parse_work_days(self.work_days)
+
+    @property
+    def holidays(self) -> tuple[frozenset[date], frozenset[tuple[int, int]]]:
+        """Нерабочие даты: (конкретные даты, ежегодные (месяц, день))."""
+        return parse_days_off(self.days_off)
+
     @field_validator("studio_tz")
     @classmethod
     def _known_tz(cls, value: str) -> str:
@@ -100,6 +126,38 @@ class Settings(BaseSettings):
     @property
     def zone(self) -> ZoneInfo:
         return ZoneInfo(self.studio_tz)
+
+
+def parse_work_days(value: str) -> frozenset[int]:
+    """«1-5» / «1,3,5-7» → номера дней недели. Ошибка — сразу при старте, а не на первом клиенте."""
+    days: set[int] = set()
+    for part in value.replace(" ", "").split(","):
+        first, dash, last = part.partition("-")
+        if not first.isdigit() or (dash and not last.isdigit()):
+            raise ValueError(f"WORK_DAYS: {value!r} — нужно вида 1-5 или 1,2,3,4,5 (1 — понедельник)")
+        lo, hi = int(first), int(last or first)
+        if not 1 <= lo <= hi <= 7:
+            raise ValueError(f"WORK_DAYS: {part!r} — дни от 1 (понедельник) до 7 (воскресенье)")
+        days.update(range(lo, hi + 1))
+    return frozenset(days)
+
+
+def parse_days_off(value: str) -> tuple[frozenset[date], frozenset[tuple[int, int]]]:
+    dates: set[date] = set()
+    yearly: set[tuple[int, int]] = set()
+    for part in filter(None, (p.strip() for p in value.split(","))):
+        try:
+            if len(part) == 10:
+                dates.add(date.fromisoformat(part))
+            elif len(part) == 5 and part[2] == "-":
+                month, day = int(part[:2]), int(part[3:])
+                date(2024, month, day)  # високосный год: 02-29 допустим
+                yearly.add((month, day))
+            else:
+                raise ValueError
+        except ValueError:
+            raise ValueError(f"DAYS_OFF: {part!r} — нужно 2026-12-31 (дата) или 01-01 (каждый год)") from None
+    return frozenset(dates), frozenset(yearly)
 
 
 @lru_cache

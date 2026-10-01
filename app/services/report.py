@@ -15,7 +15,7 @@ from app.db import TG_REPORT, Database, Lead, OutboxTask, now_iso
 from app.services.inwork import LOW_RATING, RATING_MAX
 from app.services.notifier import HOT_ICONS, Notifier
 from app.stages import CONTRACT, MEASURE, NO_ANSWER, REFUSE_REASONS, REFUSED, STAGE_ICONS, THINKING
-from app.worktime import is_work_time, next_work_start
+from app.worktime import next_work_start, work_time
 
 KV_LAST_REPORT = "last_report_week"  # понедельник недели, в которую отчёт уже отправлен (или бот впервые запущен)
 REPORT_DAYS_DEFAULT = 7
@@ -172,7 +172,7 @@ class Reports:
         пропускаем: отчёт «за прошлую неделю» сразу после установки бота никому не нужен."""
         s = self.settings
         local = now.astimezone(s.zone)
-        if not s.weekly_report or not is_work_time(local, s.work_start, s.work_end):
+        if not s.weekly_report or not work_time(local, s):
             return
         monday = local.date() - timedelta(days=local.weekday())
         last = await self.db.kv_get(KV_LAST_REPORT)

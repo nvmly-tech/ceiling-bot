@@ -24,7 +24,7 @@ from app.config import Settings
 from app.db import STT_SHADOW, STT_TRANSCRIBE, Database, now_iso
 from app.parsing import clip
 from app.services.stt import SpeechService
-from app.worktime import is_work_time, local_now, manager_eta
+from app.worktime import local_now, manager_eta, work_time
 
 log = logging.getLogger(__name__)
 
@@ -175,9 +175,9 @@ async def ask(message: Message, db: Database, lead_id: int, state: State) -> Non
 
 def done_eta(settings: Settings) -> str:
     now = local_now(settings.zone)
-    if is_work_time(now, settings.work_start, settings.work_end):
+    if work_time(now, settings):
         return texts.DONE_ETA_DAY
-    return manager_eta(now, settings.work_start, settings.work_end)
+    return manager_eta(now, settings)
 
 
 async def complete(message: Message, state: FSMContext, db: Database, settings: Settings, lead_id: int) -> None:

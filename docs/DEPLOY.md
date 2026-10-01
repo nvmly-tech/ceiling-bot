@@ -87,6 +87,7 @@ cd ceiling-bot
 | `BOT_TOKEN` | токен бота |
 | `MANAGER_CHAT_ID` | id группы менеджеров (`-100…`) |
 | `STUDIO_TZ`, `WORK_START`, `WORK_END` | часовой пояс и рабочие часы: ночной режим, напоминания, утренняя сводка |
+| `WORK_DAYS`, `DAYS_OFF` | рабочие дни недели (`1-5` — пятидневка, по умолчанию все) и праздники (`2026-12-31`, `01-01`) |
 | `TRELLO_API_KEY`, `TRELLO_TOKEN`, `TRELLO_BOARD_ID` | доступ к доске Trello |
 | `GROQ_API_KEY` | резервная нейросеть и расшифровка голосовых |
 | `LLM_PRIMARY_BASE_URL`, `LLM_PRIMARY_API_KEY`, `LLM_PRIMARY_MODEL` | основная нейросеть: `https://router.cheap/v1`, ключ, `deepseek-v4.1-flash` |

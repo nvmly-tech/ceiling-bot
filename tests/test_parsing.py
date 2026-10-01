@@ -1,7 +1,9 @@
 from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from app.config import Settings
 from app.parsing import normalize_phone, parse_area
 from app.worktime import is_work_time, manager_eta
 
@@ -47,8 +49,9 @@ def test_worktime():
     start, end = time(9), time(21)
     assert is_work_time(datetime(2026, 9, 25, 12, 0), start, end)
     assert not is_work_time(datetime(2026, 9, 25, 23, 0), start, end)
-    assert manager_eta(datetime(2026, 9, 25, 3, 0), start, end) == "сегодня в 9:00"
-    assert manager_eta(datetime(2026, 9, 25, 23, 0), start, end) == "завтра в 9:00"
+    settings, zone = Settings(bot_token="1:T", work_start=start, work_end=end), ZoneInfo("Europe/Moscow")
+    assert manager_eta(datetime(2026, 9, 25, 3, 0, tzinfo=zone), settings) == "сегодня в 9:00"
+    assert manager_eta(datetime(2026, 9, 25, 23, 0, tzinfo=zone), settings) == "завтра в 9:00"
 
 
 def test_mask_phones_with_dot_inside_number():

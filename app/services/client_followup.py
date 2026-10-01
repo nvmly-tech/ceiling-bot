@@ -17,7 +17,7 @@ from app.bot import texts
 from app.config import Settings
 from app.db import TG_TO_CLIENT, Database, Lead, OutboxTask, now_iso
 from app.stages import MEASURE, REFUSED, stamp, when_text
-from app.worktime import is_work_time, next_work_start
+from app.worktime import next_work_start, work_time
 
 log = logging.getLogger(__name__)
 
@@ -113,7 +113,7 @@ class ClientFollowUp:
     async def scan(self, now: datetime) -> None:
         """Что пора написать клиентам. Только в рабочее время студии — ночью клиента не беспокоим."""
         s = self.settings
-        if not is_work_time(now.astimezone(s.zone), s.work_start, s.work_end):
+        if not work_time(now, s):
             return
         await self._remind_measures(now)
         await self._ask_contact(now)

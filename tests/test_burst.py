@@ -71,8 +71,8 @@ async def test_digest_lists_only_last_night_and_is_capped(env: Env):
     fresh = await night_leads(env.db, LIST_MAX + 5)
     await env.tick(at(1, 9, 0) + timedelta(seconds=30))
     [digest] = [m for m in env.session.sent(GROUP) if m.text.startswith("☀️")]
-    assert f"Ночных заявок ждут менеджера: {len(fresh)}" in digest.text
-    assert all(f"№{i} " not in digest.text for i in old)
+    assert f"Заявки за нерабочее время ждут менеджера: {len(fresh)}" in digest.text
+    assert all(f"№{i}<" not in digest.text for i in old)
     assert len(buttons(digest)) == LIST_MAX and "и ещё 5" in digest.text and len(digest.text) <= 4096
 
 
