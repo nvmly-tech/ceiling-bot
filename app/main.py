@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from functools import partial
 
 from aiogram import Bot, Dispatcher
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 
 from app import redact
 from app.bot.assistant import LeadAssistant
@@ -41,7 +42,10 @@ def build_dispatcher(
     db: Database, settings: Settings, notifier: Notifier | None = None, stt: SpeechService | None = None,
     assistant: LeadAssistant | None = None, monitor: HealthMonitor | None = None, facts: StudioFacts | None = None,
 ) -> Dispatcher:
-    dp = Dispatcher(storage=SQLiteStorage(db))
+    # Обновления одного чата — строго по одному (замок на ключ FSM на всё время обработки). Иначе пачка сообщений,
+    # пришедшая разом, проходит проверку флуда раньше, чем первое из них записано в базу, и лимит не держит
+    # расход на Groq и Trello. aiogram не удаляет замки: по одному на клиента до перезапуска — объём ничтожный.
+    dp = Dispatcher(storage=SQLiteStorage(db), events_isolation=SimpleEventIsolation())
     dp["monitor"] = monitor
     dp["db"] = db
     dp["settings"] = settings

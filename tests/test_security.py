@@ -1,5 +1,6 @@
 """Регрессионные тесты находок проверки безопасности (сессия 002)."""
 
+import asyncio
 import io
 import logging
 import re
@@ -215,6 +216,20 @@ async def test_message_flood_is_not_stored(db):
     lead = await db.last_lead(USER.id)
     for i in range(30):
         await client.text(f"спам {i}")
+    stored = [m for m in await db.get_messages(lead.id) if m.direction == "in"]
+    assert len(stored) == dialog.FLOOD_PER_MIN
+    sent = [m.text for m in client.session.sent(CHAT.id)]
+    assert sent.count(texts.FLOOD) == 1
+
+
+async def test_concurrent_burst_respects_flood_limit(db):
+    # Telegram отдаёт пачку обновлений разом, а aiogram обрабатывает каждое отдельной задачей. Проверка флуда
+    # не должна пропускать всю пачку раньше, чем первые сообщения записаны в базу (аудит run-2: 30 голосовых
+    # ушли в платную расшифровку при лимите 20 в минуту).
+    client, _ = make_client(db)
+    await client.text("/start")
+    lead = await db.last_lead(USER.id)
+    await asyncio.gather(*(client.text(f"спам {i}") for i in range(30)))
     stored = [m for m in await db.get_messages(lead.id) if m.direction == "in"]
     assert len(stored) == dialog.FLOOD_PER_MIN
     sent = [m.text for m in client.session.sent(CHAT.id)]
