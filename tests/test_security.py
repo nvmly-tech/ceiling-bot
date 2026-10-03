@@ -112,6 +112,20 @@ async def test_alerts_are_redacted(db):
     assert session.sent(GROUP)[0].text == "ошибка ***"
 
 
+async def test_status_masks_secrets_in_model_errors(db):
+    # /status видит вся группа менеджеров. Текст ошибки модели — как алерты и outbox — без секретов, даже если
+    # провайдер однажды вернёт ключ в теле ошибки (Groq и router.cheap сейчас его не повторяют — 03.10.26).
+    from app.services.llm import FAIL_THRESHOLD
+    from tests.test_health import CheckedProvider, make_monitor
+
+    redact.register(TOKEN)
+    monitor, _, _, router = await make_monitor(db, providers=[CheckedProvider("groq: gpt-oss")])
+    for _ in range(FAIL_THRESHOLD):
+        router.record_fail("groq: gpt-oss", f"groq: HTTP 401 invalid key {TOKEN}")
+    text = await monitor.status_text()
+    assert "отключена до" in text and TOKEN not in text and "***" in text
+
+
 # --- 2. длина текстов ---
 
 

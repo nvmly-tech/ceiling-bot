@@ -365,7 +365,7 @@ class HealthMonitor:
                 h = self.llm.health[p.label]
                 if h.is_down:
                     until = h.down_until.astimezone(self.settings.zone).strftime("%H:%M")
-                    error = escape(h.last_error or "")[:150]
+                    error = escape(redact(h.last_error or ""))[:150]  # /status видит вся группа — без секретов
                     lines.append(f"⛔ {escape(p.label)} — отключена до {until}: <code>{error}</code>")
                 elif h.failures:
                     lines.append(f"⚠️ {escape(p.label)} — ошибок подряд: {h.failures}")
