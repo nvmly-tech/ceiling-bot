@@ -549,7 +549,10 @@ class Notifier:
         if work_now:
             await self._remind([lead for lead in waiting if self._remind_due(lead, now)], now)
             for lead in await self.db.leads_in_work():
-                await self._follow_up(lead, now)
+                try:
+                    await self._follow_up(lead, now)
+                except Exception:  # одна испорченная заявка не останавливает напоминания по остальным
+                    log.exception("notifier: заявка %s пропущена в напоминаниях", lead.id)
             await self._escalate_untaken([lead for lead in waiting if self._untaken_due(lead, now)], now)
 
         today = now.astimezone(s.zone).date().isoformat()
@@ -561,7 +564,10 @@ class Notifier:
                 await self.db.enqueue(TG_DIGEST, None, {"lead_ids": night})
 
         for extra in self.extra_scans:
-            await extra(now)
+            try:
+                await extra(now)
+            except Exception:  # сбой одной проверки (вопросы клиентам, отчёт) не отменяет остальные
+                log.exception("notifier: сбой фоновой проверки %s", getattr(extra, "__qualname__", extra))
 
     async def _follow_up(self, lead: Lead, now: datetime) -> None:
         """Взятая заявка без итога: пора ли напомнить менеджеру и сообщить владельцу."""

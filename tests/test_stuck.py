@@ -185,3 +185,17 @@ async def test_old_leads_not_nudged_after_upgrade(db: Database):
     await env.client.press_in_group(env.group()[0], "st:1:no_answer")  # новый этап — напоминания снова работают
     await env.tick(datetime.now(UTC) + timedelta(minutes=125))
     assert len(nudges(env)) == 1
+
+
+async def test_broken_lead_does_not_stop_scheduler_for_others(env: Env):
+    # Заявка с испорченной датой замера (старые данные или ошибка) не должна останавливать напоминания по
+    # остальным заявкам и проверки клиентам на каждом тике (аудит run-2).
+    t0 = await take(env)
+    other = await env.db.create_lead(tg_user_id=2002, chat_id=2002, name="Б", username=None, is_night=False)
+    await env.db.update_lead(other.id, status="qualified", notified_status="qualified", notified_at=now_iso(t0))
+    await env.db.take_lead(other.id, by_id=8, by_name="Олег")
+    await env.db.conn.execute("UPDATE leads SET stage = ?, measure_at = ? WHERE id = 1",
+                              (stages.MEASURE, "9999-12-31T20:00:00+00:00"))
+    await env.db.conn.commit()
+    await env.tick(datetime.now(UTC) + timedelta(minutes=125))  # не падает
+    assert any("№2" in n.text for n in nudges(env))  # заявку после испорченной обработали

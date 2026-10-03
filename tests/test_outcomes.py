@@ -8,6 +8,8 @@ from aiogram.methods import AnswerCallbackQuery, EditMessageReplyMarkup, EditMes
 from aiogram.types import Chat
 
 from app import stages
+from app.bot.outcomes import DAYS_AHEAD, parse_moment
+from app.config import Settings
 from app.db import Database
 from tests.conftest import MANAGER2, USER
 from tests.test_notifier import Env, make_env
@@ -189,6 +191,8 @@ async def test_stage_buttons_need_taken_lead_and_manager_chat(env: Env):
 @pytest.mark.parametrize("data", [
     "st:x:no_answer", "st:1", "st:1:fly", "st:1:at:garbage", "st:1:at:2026133014", "st:1:rsn:unknown",
     "st:1:day:2026", "st:99:no_answer",
+    # Дата вне окна, которое предлагают кнопки (аудит run-2: «9999 год» ронял каждый тик планировщика).
+    "st:1:at:9999123123", f"st:1:at:{day_code(DAYS_AHEAD + 3)}12", f"st:1:at:{day_code(-3)}12",
 ])
 async def test_forged_stage_callbacks_change_nothing(env: Env, data: str):
     await take(env)
@@ -213,3 +217,18 @@ async def test_order_status_for_client(env: Env):
     await env.client.text("/order")
     assert "замер назначен" in env.client.last_text() and "в 15:00" in env.client.last_text()
     assert (await env.db.last_lead(USER.id)).stage == stages.MEASURE
+
+
+async def test_forged_far_day_shows_no_hours(env: Env):
+    await take(env)
+    await press(env, "st:1:measure")
+    await press(env, "st:1:day:99991231")
+    assert not [b for b in buttons(last_markup(env)) if ":at:" in b]  # часы на 9999 год не предлагаем
+
+
+def test_measure_hour_outside_work_time_rejected():
+    from datetime import time
+
+    settings = Settings(bot_token="123:TEST", work_start=time(9), work_end=time(21))
+    assert parse_moment(f"{day_code(1)}14", settings) is not None
+    assert parse_moment(f"{day_code(1)}03", settings) is None  # такой кнопки не было

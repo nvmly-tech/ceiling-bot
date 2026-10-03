@@ -68,19 +68,29 @@ def parse(data: str) -> tuple[int, str, str] | None:
     return int(parts[1]), parts[2], parts[3] if len(parts) == 4 else ""
 
 
-def parse_day(value: str) -> date | None:
+def _offered(day: date, settings: Settings) -> bool:
+    """День из окна, которое предлагают кнопки (и вчера — кнопку могли нажать после полуночи). Данные кнопки шлёт
+    клиент Telegram: подделанная дата («9999 год») ломала бы расчёты планировщика на каждом тике."""
+    today = datetime.now(settings.zone).date()
+    return today - timedelta(days=1) <= day < today + timedelta(days=DAYS_AHEAD)
+
+
+def parse_day(value: str, settings: Settings) -> date | None:
     try:
-        return datetime.strptime(value, "%Y%m%d").date()
+        day = datetime.strptime(value, "%Y%m%d").date()
     except ValueError:
         return None
+    return day if _offered(day, settings) else None
 
 
 def parse_moment(value: str, settings: Settings) -> datetime | None:
-    """«2026100214» → 02.10.2026 14:00 по часовому поясу студии."""
+    """«2026100214» → 02.10.2026 14:00 по часовому поясу студии. Только день и час, какие предлагают кнопки."""
     try:
-        return datetime.strptime(value, "%Y%m%d%H").replace(tzinfo=settings.zone)
+        moment = datetime.strptime(value, "%Y%m%d%H").replace(tzinfo=settings.zone)
     except ValueError:
         return None
+    hours = measure_hours(settings.work_start, settings.work_end)
+    return moment if _offered(moment.date(), settings) and moment.hour in hours else None
 
 
 PICKER_HINTS = {"measure": "Выберите день замера", "day": "Выберите время", "refuse": "Выберите причину"}
@@ -91,7 +101,7 @@ def picker(action: str, value: str, lead: Lead, settings: Settings) -> InlineKey
     if action == "measure":
         return days_keyboard(lead.id, datetime.now(settings.zone).date())
     if action == "day":
-        day = parse_day(value)
+        day = parse_day(value, settings)
         return hours_keyboard(lead.id, day, settings) if day else None
     if action == "refuse":
         return reasons_keyboard(lead.id)
