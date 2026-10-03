@@ -151,3 +151,59 @@ async def test_phone_of_deleted_lead_not_matched(db):
     await env.tick()
     await manager_says(env, 706, "8 900 123-45-67")  # заявки уже нет — привязывать не к чему
     assert await db.tg_messages(1) == []
+
+
+# --- телефон считается номером клиента, только если он поделился своим контактом ---
+
+
+async def test_typed_copy_of_clients_phone_does_not_pull_in_manager_message(db):
+    # Номер, набранный вручную, не доказывает, что он принадлежит клиенту. Иначе, вписав чужой номер и удалив свою
+    # заявку, клиент удалил бы сообщения менеджеров о чужой заявке (аудит run-2).
+    env = await lead_with_two_notifications(db)  # +79001234567 — контакт самого клиента, кнопкой
+    other = await db.create_lead(tg_user_id=2002, chat_id=2002, name="Б", username=None, is_night=False)
+    await db.update_lead(other.id, phone="+79001234567")  # тот же номер, но набран вручную
+    await manager_says(env, 707, "Перезвонить 8 900 123-45-67")
+    assert await group_message_ids(db, other.id) == set()
+    assert 707 in await group_message_ids(db, 1)
+
+    await db.delete_lead_data(other.id)
+    await env.tick()
+    assert 707 not in env.session.deleted()
+    await db.delete_lead_data(1)
+    await env.tick()
+    assert 707 in env.session.deleted()  # владелец номера удаляет свою заявку — как раньше
+
+
+async def test_someone_elses_contact_card_is_not_verified(db):
+    from aiogram.types import Contact
+
+    env = await make_env(db)
+    client = env.client
+    await client.text("/start")
+    await client.press("obj:flat")
+    await client.text("18,5")
+    await client.press("ct:matte")
+    card = Contact(phone_number="79112223344", first_name="Сосед", user_id=999)  # пересланная карточка чужого
+    await client._feed(message=client._message(contact=card))
+    await client.text("в субботу")
+    assert (await db.get_lead(1)).phone == "+79112223344"
+    await manager_says(env, 708, "Сосед +7 911 222-33-44 привезёт ключи")
+    assert 708 not in await group_message_ids(db, 1)
+
+
+async def test_phone_typed_in_order_edit_is_not_verified(db):
+    env = await lead_with_two_notifications(db)
+    await env.client.text("/order")
+    await env.client.press("edit:phone:1")
+    await env.client.text("8 911 000-00-00")
+    assert (await db.get_lead(1)).phone == "+79110000000"
+    await manager_says(env, 709, "Набрать 8 911 000-00-00")
+    assert 709 not in await group_message_ids(db, 1)
+
+
+async def test_phone_verification_follows_the_number(db):
+    lead = await db.create_lead(tg_user_id=1, chat_id=1, name="А", username=None, is_night=False)
+    lead = await db.update_lead(lead.id, phone="+79001234567", phone_verified=True)
+    assert lead.phone_verified
+    assert (await db.update_lead(lead.id, phone="+79001234567")).phone_verified  # тот же номер набран вручную
+    assert not (await db.update_lead(lead.id, phone="+79007654321")).phone_verified  # другой номер — уже нет

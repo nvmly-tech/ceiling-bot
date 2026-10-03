@@ -60,6 +60,7 @@ class Incoming:
     duration: int = 0  # секунд, для голосовых
     stt_model: str | None = None  # какая модель расшифровала голосовое
     shadow: bool = False  # после записи — теневая расшифровка другой моделью (для сравнения)
+    own_contact: bool = False  # контакт самого отправителя (кнопка «Поделиться номером»), а не чужая карточка
 
     @property
     def pending(self) -> bool:
@@ -74,7 +75,8 @@ class Incoming:
 
 def incoming(message: Message) -> Incoming:
     if message.contact:
-        return Incoming("contact", message.contact.phone_number)
+        own = message.from_user is not None and message.contact.user_id == message.from_user.id
+        return Incoming("contact", message.contact.phone_number, own_contact=own)
     if message.voice:
         return Incoming("voice", None, message.voice.file_id, message.voice.duration or 0)
     if message.text:

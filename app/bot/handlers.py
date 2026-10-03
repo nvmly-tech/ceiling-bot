@@ -337,8 +337,10 @@ def measure_time_from(rest: str) -> str | None:
 async def on_phone(message: Message, state: FSMContext, db: Database, settings: Settings, item: Incoming) -> None:
     lead_id = (await state.get_data())["lead_id"]
     await log_in(db, lead_id, item, "phone")
+    verified: dict[str, bool] = {}  # набранный номер подтверждение не меняет — решает update_lead
     if item.kind == "contact":
         phone = normalize_phone(item.text) or clip(item.text)
+        verified = {"phone_verified": item.own_contact}
     elif item.kind == "text" and item.text == texts.NO_PHONE:
         phone = texts.NO_PHONE_VALUE
     elif item.pending:
@@ -355,7 +357,7 @@ async def on_phone(message: Message, state: FSMContext, db: Database, settings: 
             await db.update_lead(lead_id, phone=phone, measure_time=when)
             await advance(message, state, db, settings, lead_id)
             return
-    await db.update_lead(lead_id, phone=phone)
+    await db.update_lead(lead_id, phone=phone, **verified)
     await advance(message, state, db, settings, lead_id)
 
 

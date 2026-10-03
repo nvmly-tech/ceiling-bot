@@ -127,7 +127,7 @@ async def on_edit_text(message: Message, state: FSMContext, db: Database, settin
         if phone is None:
             await message.answer(texts.Q_PHONE_RETRY, reply_markup=keyboards.phone())
             return
-        values = {"phone": phone}
+        values = {"phone": phone, **({"phone_verified": item.own_contact} if item.kind == "contact" else {})}
     else:
         values = {field: item.answer}
     if item.kind != "text":

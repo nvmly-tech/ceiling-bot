@@ -36,7 +36,7 @@ LEAD_FIELDS = CARD_FIELDS | {
     "trello_card_id", "trello_card_url", "completed_at", "notified_status", "notified_at",
     "reminders_sent", "last_reminder_at", "client_msgs_notified", "summary_status", "stage_at", "stage_by_name",
     "nudges_sent", "last_nudge_at", "escalated_at", "measure_reminded_for", "contact_asked_at", "contact_answer",
-    "rating_asked_at", "visit_answer", "manager_reply_at",
+    "rating_asked_at", "visit_answer", "manager_reply_at", "phone_verified",
 }
 ONCE_FIELDS = {"contact_answer", "rating"}  # ответы клиента: принимается только первый
 
@@ -125,6 +125,7 @@ class Lead:
     source: str | None = None
     visit_answer: str | None = None
     manager_reply_at: str | None = None
+    phone_verified: bool = False  # номер пришёл своим контактом клиента (кнопка «Поделиться номером»)
 
 
 @dataclass
@@ -260,10 +261,16 @@ class Database:
         if fields or events:
             async with self._tx():
                 if fields:
-                    cols = ", ".join(f"{k} = ?" for k in fields)
+                    cols = [f"{k} = ?" for k in fields]
+                    values = list(fields.values())
+                    if "phone" in fields and "phone_verified" not in fields:
+                        # Номер не из своего контакта (набран, продиктован, извлечён LLM): подтверждение остаётся,
+                        # только если номер не изменился. CASE сравнивает со старым значением строки.
+                        cols.append("phone_verified = CASE WHEN phone IS ? THEN phone_verified ELSE 0 END")
+                        values.append(fields["phone"])
                     await self.conn.execute(
-                        f"UPDATE leads SET {cols}, updated_at = ? WHERE id = ?",
-                        (*fields.values(), now_iso(), lead_id),
+                        f"UPDATE leads SET {', '.join(cols)}, updated_at = ? WHERE id = ?",
+                        (*values, now_iso(), lead_id),
                     )
                     if fields.keys() & CARD_FIELDS:
                         await self._enqueue(CARD_UPDATE, lead_id, coalesce=True)
@@ -462,7 +469,8 @@ class Database:
             await self.conn.execute(
                 "UPDATE leads SET status = 'deleted', tg_user_id = 0, chat_id = 0, name = NULL, username = NULL,"
                 " object = NULL, area_m2 = NULL, area_text = NULL, ceiling_type = NULL, phone = NULL,"
-                " measure_time = NULL, summary = NULL, hotness = NULL, hotness_reason = NULL, summary_model = NULL,"
+                " phone_verified = 0, measure_time = NULL, summary = NULL, hotness = NULL, hotness_reason = NULL,"
+                " summary_model = NULL,"
                 " summary_status = NULL, updated_at = ? WHERE id = ?",
                 (now_iso(), lead_id),
             )
@@ -500,12 +508,16 @@ class Database:
             return [r[0] for r in await cur.fetchall()]
 
     async def leads_by_phones(self, phones: Sequence[str]) -> list[int]:
-        """Живые заявки с этими номерами (+7XXXXXXXXXX) — для сообщений менеджеров, где упомянут телефон клиента."""
+        """Живые заявки с этими номерами (+7XXXXXXXXXX) — для сообщений менеджеров, где упомянут телефон клиента.
+        Только подтверждённые номера (свой контакт клиента): иначе клиент, вписав чужой номер, втянул бы в удаление
+        своей заявки сообщения менеджеров о чужом человеке."""
         if not phones:
             return []
         marks = ", ".join("?" * len(phones))
         async with self.conn.execute(
-            f"SELECT id FROM leads WHERE phone IN ({marks}) AND status != 'deleted' ORDER BY id", list(phones)
+            f"SELECT id FROM leads WHERE phone IN ({marks}) AND phone_verified = 1 AND status != 'deleted'"
+            " ORDER BY id",
+            list(phones),
         ) as cur:
             return [r[0] for r in await cur.fetchall()]
 
@@ -733,4 +745,5 @@ def _row(cls: type[T], row: aiosqlite.Row) -> T:
 def _lead(row: aiosqlite.Row) -> Lead:
     lead = _row(Lead, row)
     lead.is_night = bool(lead.is_night)
+    lead.phone_verified = bool(lead.phone_verified)
     return lead
