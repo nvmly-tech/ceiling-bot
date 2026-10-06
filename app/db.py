@@ -39,6 +39,15 @@ LEAD_FIELDS = CARD_FIELDS | {
     "rating_asked_at", "visit_answer", "manager_reply_at", "phone_verified",
 }
 ONCE_FIELDS = {"contact_answer", "rating"}  # ответы клиента: принимается только первый
+# Клиент удалил заявку — стирается всё о нём: анкета, резюме и то, что заявка узнала после «Взял» (источник,
+# замер, ответы на вопросы бота, оценка, причина отказа). Остаются номер, статус, этап и кто из менеджеров вёл
+# заявку — по ним клиента не узнать.
+WIPED_ON_DELETE = "tg_user_id = 0, chat_id = 0, phone_verified = 0, " + ", ".join(f"{column} = NULL" for column in (
+    "name", "username", "object", "area_m2", "area_text", "ceiling_type", "phone", "measure_time",
+    "summary", "hotness", "hotness_reason", "summary_model", "summary_status",
+    "source", "measure_at", "measure_reminded_for", "visit_answer", "contact_asked_at", "contact_answer",
+    "rating_asked_at", "rating", "refuse_reason",
+))
 
 # Задачи outbox. Префикс до точки — канал: у каждого лида своя очередь на канал.
 CARD_CREATE = "trello.card_create"
@@ -188,6 +197,8 @@ class Database:
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.executescript(SCHEMA)
         await self._migrate()
+        # Заявки, удалённые прежними версиями (они стирали меньше полей), дочищаются при каждом запуске.
+        await self._conn.execute(f"UPDATE leads SET {WIPED_ON_DELETE} WHERE status = 'deleted'")
         await self._conn.commit()
 
     async def _migrate(self) -> None:
@@ -452,8 +463,9 @@ class Database:
         )
 
     async def delete_lead_data(self, lead_id: int) -> None:
-        """Клиент удалил заявку: стереть его данные в одной транзакции. Остаётся обезличенная строка (номер и
-        status='deleted') — по ней очередь удалит карточку Trello, если она есть или создаётся прямо сейчас."""
+        """Клиент удалил заявку: стереть его данные в одной транзакции. Остаётся обезличенная строка (номер,
+        status='deleted', этап и кто из менеджеров вёл, см. WIPED_ON_DELETE) — по ней очередь удалит карточку
+        Trello, если она есть или создаётся прямо сейчас."""
         async with self._tx():
             lead = await self.get_lead(lead_id)
             if lead is None or lead.status == "deleted":
@@ -467,11 +479,7 @@ class Database:
             await self.conn.execute("DELETE FROM outbox WHERE lead_id = ? AND done_at IS NULL", (lead_id,))
             await self.conn.execute("DELETE FROM messages WHERE lead_id = ?", (lead_id,))
             await self.conn.execute(
-                "UPDATE leads SET status = 'deleted', tg_user_id = 0, chat_id = 0, name = NULL, username = NULL,"
-                " object = NULL, area_m2 = NULL, area_text = NULL, ceiling_type = NULL, phone = NULL,"
-                " phone_verified = 0, measure_time = NULL, summary = NULL, hotness = NULL, hotness_reason = NULL,"
-                " summary_model = NULL,"
-                " summary_status = NULL, updated_at = ? WHERE id = ?",
+                f"UPDATE leads SET status = 'deleted', {WIPED_ON_DELETE}, updated_at = ? WHERE id = ?",
                 (now_iso(), lead_id),
             )
             if lead.trello_card_id or card_planned:

@@ -3,7 +3,8 @@
 from datetime import UTC, datetime, timedelta
 
 from app.bot import texts
-from app.db import TG_CLIENT_MSG
+from app.db import TG_CLIENT_MSG, Database
+from app.stages import REFUSED
 from tests.conftest import CHAT, USER, Client
 from tests.test_notifier import Env, make_env
 from tests.test_trello import complete_dialog
@@ -185,6 +186,57 @@ async def test_delete_wipes_data_card_and_tells_manager(db):
     assert env.client.last_text() == texts.ORDER_NONE
     await env.client.text("/start")  # можно оставить новую
     assert (await db.last_lead(USER.id)).id == 2
+
+
+# Что заявка узнаёт о клиенте после «Взял в работу»: при удалении стирается вместе с анкетой.
+CLIENT_TRACES = {
+    "source": "avito", "measure_at": "2026-10-07T11:00:00+00:00", "measure_reminded_for": "2026-10-07T11:00:00+00:00",
+    "visit_answer": "move", "contact_asked_at": "2026-10-06T12:00:00+00:00", "contact_answer": "no",
+    "rating_asked_at": "2026-10-07T15:00:00+00:00", "rating": 2, "refuse_reason": "price",
+}
+
+
+async def mark_full_cycle(db: Database, lead_id: int) -> None:
+    """Заявка прошла весь путь: источник, замер и его перенос, вопросы клиенту, оценка, отказ с причиной."""
+    cols = ", ".join(f"{k} = ?" for k in CLIENT_TRACES)
+    await db.conn.execute(
+        f"UPDATE leads SET {cols}, stage = ?, stage_by_name = ? WHERE id = ?",
+        (*CLIENT_TRACES.values(), REFUSED, "Иван", lead_id),
+    )
+    await db.conn.commit()
+
+
+def traces(lead) -> dict:
+    return {k: getattr(lead, k) for k in CLIENT_TRACES}
+
+
+async def test_delete_wipes_what_lead_learned_after_take(client: Client, db):
+    await complete_dialog(client)
+    await mark_full_cycle(db, 1)
+    await db.delete_lead_data(1)
+    lead = await db.get_lead(1)
+    assert traces(lead) == dict.fromkeys(CLIENT_TRACES)
+    # Работа менеджера остаётся — клиента по ней не узнать.
+    assert (lead.stage, lead.stage_by_name) == (REFUSED, "Иван")
+
+
+async def test_startup_wipes_leads_deleted_by_older_version(tmp_path):
+    path = tmp_path / "bot.sqlite3"
+    old = Database(path)
+    await old.connect()
+    lead = await old.create_lead(tg_user_id=5, chat_id=5, name="Анна", username=None, is_night=False)
+    await mark_full_cycle(old, lead.id)
+    # Прежняя версия стирала только анкету: этап, замер и ответы клиента оставались в строке.
+    await old.conn.execute("UPDATE leads SET status = 'deleted', name = NULL WHERE id = ?", (lead.id,))
+    await old.conn.commit()
+    await old.close()
+
+    db = Database(path)
+    await db.connect()
+    try:
+        assert traces(await db.get_lead(lead.id)) == dict.fromkeys(CLIENT_TRACES)
+    finally:
+        await db.close()
 
 
 async def test_delete_before_card_created_cancels_pending_tasks(db):
