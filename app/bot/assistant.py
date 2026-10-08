@@ -13,7 +13,20 @@ from functools import partial
 from typing import Any
 
 from app.bot import prompts, texts
-from app.bot.facts import CeilingVocab, StudioFacts, default_facts, is_adjective, rubles, stem
+from app.bot.facts import (
+    FREE,
+    CeilingVocab,
+    PromiseVocab,
+    StudioFacts,
+    default_facts,
+    free_words,
+    is_adjective,
+    offers,
+    percents,
+    rubles,
+    sentences,
+    stem,
+)
 from app.db import Lead, Message
 from app.parsing import AREA_MAX, AREA_MIN, clip, normalize_phone, parse_area, replace_phones
 from app.services.llm import LLMRouter
@@ -175,12 +188,38 @@ def check_amounts(reply: str, allowed: Collection[int]) -> None:
         raise ValueError(f"сумма не из фактов о студии: {sorted(unknown)}")
 
 
-def parse_turn(data: dict, allowed: Collection[int] | None = None, types: CeilingVocab | None = None) -> Turn:
+# Отсылка к менеджеру — не обещание: «про скидки расскажет менеджер». Без этого исключения такой ответ — брак,
+# а скрипт, на который тогда переходит бот, примет вопрос «а скидки есть?» за ответ на вопрос анкеты.
+_DEFERRED = re.compile(r"менеджер|уточн|обсуд")
+
+
+def check_promises(reply: str, vocab: PromiseVocab) -> None:
+    """Скидку, рассрочку, подарок, «бесплатно» или процент клиент сочтёт обещанием студии — даже если модель
+    уговорил он сам. Можно только то, что есть в фактах; слова (не цифры) — ещё и в отсылке к менеджеру."""
+    for sentence in sentences(reply):
+        if "%" in sentence or "процент" in sentence:
+            found = percents(sentence)
+            if found - vocab.percents or not (found or vocab.percents):
+                raise ValueError(f"обещание не из фактов о студии: процент в «{sentence.strip()}»")
+        if _DEFERRED.search(sentence):
+            continue
+        if unknown := offers(sentence) - vocab.offers:
+            raise ValueError(f"обещание не из фактов о студии: {sorted(unknown)}")
+        for clause in re.split(r"[,;]", sentence):
+            if FREE in clause and not free_words(clause) & vocab.free:
+                raise ValueError(f"обещание не из фактов о студии: бесплатно в «{clause.strip()}»")
+
+
+def parse_turn(
+    data: dict, allowed: Collection[int] | None = None, types: CeilingVocab | None = None,
+    promises: PromiseVocab | None = None,
+) -> Turn:
     reply = _str(data.get("reply"), REPLY_LIMIT)
     if not reply:
         raise ValueError("пустой reply")
     reply = _QUESTION_NUMBER.sub(r"\1", reply).strip()
     check_amounts(reply, default_facts().allowed_amounts if allowed is None else allowed)
+    check_promises(reply, default_facts().promises if promises is None else promises)
     check_ceiling_types(reply, default_facts().ceiling_types if types is None else types)
     fields = data.get("fields") or {}
     if not isinstance(fields, dict):
@@ -224,6 +263,12 @@ def parse_summary(data: dict) -> Summary:
     return Summary(summary, hotness, _str(data.get("reason"), 300) or "")
 
 
+def inert(text: str) -> str:
+    """Текст клиента для резюме — без угловых скобок. Иначе клиент мог бы «закрыть» блок <переписка> и дописать свои
+    указания, причём в любом написании тега: регистр, пробелы, латинская «p» вместо русской «р»."""
+    return text.replace("<", "‹").replace(">", "›")
+
+
 def transcript(history: list[Message]) -> str:
     lines = [f"{'Клиент' if m.direction == 'in' else 'Бот'}: {mask_phones(_line(m))[0]}" for m in history if _line(m)]
     text = "\n".join(lines)
@@ -248,8 +293,11 @@ class LeadAssistant:
         if new_text is not None:
             masked, phones = mask_phones(new_text)
             messages.append({"role": "user", "content": clip(masked, NEW_MESSAGE_MAX)})
-        messages.append({"role": "system", "content": prompts.FORMAT_REMINDER})
-        check = partial(parse_turn, allowed=self.facts.allowed_amounts, types=self.facts.ceiling_types)
+        messages.append({"role": "system", "content": prompts.DIALOG_REMINDER})
+        check = partial(
+            parse_turn, allowed=self.facts.allowed_amounts, types=self.facts.ceiling_types,
+            promises=self.facts.promises,
+        )
         turn, model = await self.router.json(messages, check)
         turn.model = model
         if phones and "phone" not in turn.updates:
@@ -258,9 +306,8 @@ class LeadAssistant:
 
     async def summarize(self, lead: Lead, history: list[Message]) -> Summary:
         status = {"qualified": "анкета заполнена", "abandoned": "анкету не закончил"}.get(lead.status, lead.status)
-        anketa = json.dumps(known_fields(lead, mask_phone=True), ensure_ascii=False)
-        # Тег закрытия в тексте клиента ломается: иначе клиент мог бы «закончить» переписку и дописать свои указания.
-        dialog = transcript(history).replace("</переписка>", "</ переписка>")
+        anketa = inert(json.dumps(known_fields(lead, mask_phone=True), ensure_ascii=False))
+        dialog = inert(transcript(history))
         user = f"Статус: {status}.\nАнкета: {anketa}\n\n<переписка>\n{dialog}\n</переписка>"
         summary, model = await self.router.json(
             [

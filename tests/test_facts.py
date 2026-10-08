@@ -39,6 +39,17 @@ def test_facts_from_file_go_to_prompt_and_limit_amounts(tmp_path):
         parse_turn(turn("Матовый — от 500 ₽/м²."), allowed=facts.allowed_amounts)
 
 
+def test_promises_from_facts_are_allowed(tmp_path):
+    path = tmp_path / "facts.md"
+    write(path, "- Скидка 5% пенсионерам.\n- Рассрочка на 6 месяцев.\n- Демонтаж старого потолка — бесплатно.\n")
+    facts = StudioFacts(path)
+    for reply in ("Пенсионерам скидка 5%.", "Есть рассрочка на 6 месяцев.", "Демонтаж старого потолка бесплатный."):
+        assert parse_turn(turn(reply), promises=facts.promises).reply == reply
+    for reply in ("Скидка 10% пенсионерам.", "Замер бесплатный.", "Подарим карниз."):
+        with pytest.raises(ValueError, match="обещание не из фактов"):
+            parse_turn(turn(reply), promises=facts.promises)
+
+
 def test_changes_are_picked_up_without_restart(tmp_path):
     path = tmp_path / "facts.md"
     write(path, "- Матовый — от 610 ₽/м².")

@@ -63,6 +63,51 @@ def rubles(text: str) -> set[int]:
     return {int(re.sub(r"\D", "", m.group(1))) for m in _RUBLES.finditer(text)}
 
 
+# Обещания сверх цен: проценты, скидки, рассрочка, подарки, «бесплатно». Модель может повторять только те, что есть
+# в фактах (см. assistant.check_promises).
+_PERCENT = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:%|процент)")
+_OFFER = re.compile(r"\b(скидк|рассрочк|кредит|акци|подар|промокод|бонус|к[еэ]шб[эе]к|предоплат|оплат)")
+FREE = "бесплатн"
+
+
+def _norm(text: str) -> str:
+    return text.lower().replace("ё", "е")
+
+
+def percents(text: str) -> set[str]:
+    return {m.group(1).replace(",", ".") for m in _PERCENT.finditer(_norm(text))}
+
+
+def offers(text: str) -> set[str]:
+    """Основы слов-обещаний в тексте: «скидку» → «скидк»."""
+    return {m.group(1) for m in _OFFER.finditer(_norm(text))}
+
+
+def sentences(text: str) -> list[str]:
+    return [s for s in re.split(r"[.!?\n]+", _norm(text)) if s.strip()]
+
+
+def free_words(clause: str) -> set[str]:
+    """Начала слов в части предложения с «бесплатно» — что именно бесплатно: «на бесплатном замере» → {«замер»}."""
+    return {w[:5] for w in re.findall(r"[а-я]+", _norm(clause)) if len(w) >= 4 and not w.startswith(FREE)}
+
+
+@dataclass(frozen=True)
+class PromiseVocab:
+    """Обещания из фактов: проценты, основы слов «скидка / рассрочка / подарок…» и что бесплатно («Замер бесплатный»
+    → «замер»; берётся часть предложения до запятой: «Замер бесплатный, монтаж — от 500 ₽» — монтаж не бесплатный)."""
+
+    percents: frozenset[str]
+    offers: frozenset[str]
+    free: frozenset[str]
+
+
+def promise_vocab(text: str) -> PromiseVocab:
+    clauses = (c for s in sentences(text) for c in re.split(r"[,;]", s) if FREE in c)
+    free = {w for c in clauses for w in free_words(c)}
+    return PromiseVocab(frozenset(percents(text)), frozenset(offers(text)), frozenset(free))
+
+
 def studio_name(text: str) -> str | None:
     match = _NAME.search(text)
     if not match:
@@ -91,6 +136,7 @@ class StudioFacts:
 
     def _set(self, text: str) -> None:
         self._text, self._amounts, self._vocab = text, frozenset(rubles(text)), ceiling_vocab(text)
+        self._promises = promise_vocab(text)
         self._name = studio_name(text)
 
     def _report(self, problem: str) -> None:
@@ -137,6 +183,11 @@ class StudioFacts:
     def ceiling_types(self) -> CeilingVocab:
         self.refresh()
         return self._vocab
+
+    @property
+    def promises(self) -> PromiseVocab:
+        self.refresh()
+        return self._promises
 
 
 _default: StudioFacts | None = None
