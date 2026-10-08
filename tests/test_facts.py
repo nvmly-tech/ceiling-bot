@@ -45,9 +45,20 @@ def test_promises_from_facts_are_allowed(tmp_path):
     facts = StudioFacts(path)
     for reply in ("Пенсионерам скидка 5%.", "Есть рассрочка на 6 месяцев.", "Демонтаж старого потолка бесплатный."):
         assert parse_turn(turn(reply), promises=facts.promises).reply == reply
-    for reply in ("Скидка 10% пенсионерам.", "Замер бесплатный.", "Подарим карниз."):
+    for reply in ("Скидка 10% пенсионерам.", "Выезд дизайнера бесплатный.", "Подарим карниз."):
         with pytest.raises(ValueError, match="обещание не из фактов"):
             parse_turn(turn(reply), promises=facts.promises)
+
+
+def test_free_measure_is_allowed_even_if_facts_do_not_say_so(tmp_path):
+    # Бесплатный замер обещают сами тексты бота и промпт («Когда удобно провести бесплатный замер?»): если студия
+    # уберёт эту строку из фактов, вопросы модели не должны отбраковываться.
+    path = tmp_path / "facts.md"
+    write(path, "- Матовый потолок — от 610 ₽/м².\n")
+    promises = StudioFacts(path).promises
+    assert parse_turn(turn("Когда удобно провести бесплатный замер?"), promises=promises).reply
+    with pytest.raises(ValueError, match="обещание не из фактов"):
+        parse_turn(turn("Монтаж бесплатно."), promises=promises)
 
 
 def test_changes_are_picked_up_without_restart(tmp_path):

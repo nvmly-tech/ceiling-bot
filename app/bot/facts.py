@@ -68,6 +68,8 @@ def rubles(text: str) -> set[int]:
 _PERCENT = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:%|процент)")
 _OFFER = re.compile(r"\b(скидк|рассрочк|кредит|акци|подар|промокод|бонус|к[еэ]шб[эе]к|предоплат|оплат)")
 FREE = "бесплатн"
+# Бесплатный замер обещают сами тексты бота и промпт (texts.Q_PHONE, prompts.FIELDS) — он разрешён и без фактов.
+ALWAYS_FREE = frozenset({"замер"})
 
 
 def _norm(text: str) -> str:
@@ -105,7 +107,7 @@ class PromiseVocab:
 def promise_vocab(text: str) -> PromiseVocab:
     clauses = (c for s in sentences(text) for c in re.split(r"[,;]", s) if FREE in c)
     free = {w for c in clauses for w in free_words(c)}
-    return PromiseVocab(frozenset(percents(text)), frozenset(offers(text)), frozenset(free))
+    return PromiseVocab(frozenset(percents(text)), frozenset(offers(text)), ALWAYS_FREE | free)
 
 
 def studio_name(text: str) -> str | None:
