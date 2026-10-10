@@ -158,6 +158,20 @@ async def test_healthcheck_ping_only_when_healthy(db, monkeypatch):
     assert route.call_count == 1  # пинг раз в 5 минут, а не на каждый такт watchdog
 
 
+@respx.mock
+@pytest.mark.parametrize(("response", "warns"), [(httpx.Response(200), False), (httpx.Response(404), True)])
+async def test_healthcheck_ping_warns_when_not_accepted(db, caplog, response, warns):
+    # Проверку удалили или в адресе опечатка: сервис отвечает 4xx — бот должен написать это в журнал.
+    url = "https://hc.example/p/SECRET-KEY/ceiling-bot"
+    respx.get(url).mock(return_value=response)
+    m, _ = await monitor(db, healthcheck_url=url)
+    with caplog.at_level(logging.WARNING, logger="app.services.health"):
+        await m._ping_healthcheck()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert [w.startswith("healthcheck: HTTP 404") for w in warnings] == ([True] if warns else [])
+    assert "SECRET-KEY" not in caplog.text  # в адресе пинга ключ мониторинга — в журнал он не попадает
+
+
 async def test_status_without_llm_and_stt(db):
     m, _ = await monitor(db)
     text = await m.status_text()

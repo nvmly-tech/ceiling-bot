@@ -204,9 +204,13 @@ class HealthMonitor:
     async def _ping_healthcheck(self) -> None:
         try:
             async with httpx.AsyncClient(timeout=10) as http:
-                await http.get(self.settings.healthcheck_url)
+                resp = await http.get(self.settings.healthcheck_url)
         except httpx.HTTPError as e:
             log.warning("healthcheck: %s", type(e).__name__)
+            return
+        if not resp.is_success:
+            # Проверку удалили или в адресе опечатка. Адрес не пишем: в нём ключ мониторинга.
+            log.warning("healthcheck: HTTP %s — пинг не принят, проверьте HEALTHCHECK_URL", resp.status_code)
 
     # --- внешние сервисы: модели, расшифровка, очередь ---
 
